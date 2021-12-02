@@ -24,7 +24,7 @@ loading these data assets into compute-ready data containers costs time and effo
 The data user needs to know what data sets are available, the attributes describing
 each data set, before loading a specific data set and analyzing it.  
 
-Finding,  investigating,  loading these assets into data array containers
+Finding, investigating, loading these assets into data array containers
 such as xarray can be a daunting task due to the large number of files
 a user may be interested in. Intake-esm aims to address these issues by
 providing necessary functionality for searching, discovering, data access/loading.
