@@ -22,9 +22,9 @@ These data are often persisted on HPC systems or in the cloud across multiple da
 assets of a variety of formats ([netCDF](https://www.unidata.ucar.edu/software/netcdf/), [zarr](https://zarr.readthedocs.io/en/stable/), etc...). Finding, investigating,
 loading these data assets into compute-ready data containers costs time and effort.
 The data user needs to know what data sets are available, the attributes describing
-each data set, before loading a specific data set and analyzing it.
+each data set, before loading a specific data set and analyzing it.  
 
-Finding, investigating, loading these assets into data array containers
+Finding,  investigating,  loading these assets into data array containers
 such as xarray can be a daunting task due to the large number of files
 a user may be interested in. Intake-esm aims to address these issues by
 providing necessary functionality for searching, discovering, data access/loading.
