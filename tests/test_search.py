@@ -1,5 +1,6 @@
 import re
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -116,6 +117,8 @@ params = [
             {'A': 'NASA', 'B': 'foo', 'C': 'HiSt', 'D': 'tAs'},
         ],
     ),
+    ({'A': None}, None, [{'A': np.nan, 'B': np.nan, 'C': 'exp', 'D': 'UA'}]),
+    ({'A': np.nan}, None, [{'A': np.nan, 'B': np.nan, 'C': 'exp', 'D': 'UA'}]),
 ]
 
 
@@ -123,10 +126,21 @@ params = [
 def test_search(query, require_all_on, expected):
     df = pd.DataFrame(
         {
-            'A': ['NCAR', 'IPSL', 'IPSL', 'CSIRO', 'IPSL', 'NCAR', 'NOAA', 'NCAR', 'NASA'],
-            'B': ['CESM', 'FOO', 'FOO', 'BAR', 'FOO', 'CESM', 'GCM', 'WACM', 'foo'],
-            'C': ['hist', 'control', 'hist', 'control', 'hist', 'control', 'hist', 'hist', 'HiSt'],
-            'D': ['O2', 'O2', 'O2', 'O2', 'NO2', 'O2', 'O2', 'TA', 'tAs'],
+            'A': ['NCAR', 'IPSL', 'IPSL', 'CSIRO', 'IPSL', 'NCAR', 'NOAA', 'NCAR', 'NASA', np.nan],
+            'B': ['CESM', 'FOO', 'FOO', 'BAR', 'FOO', 'CESM', 'GCM', 'WACM', 'foo', np.nan],
+            'C': [
+                'hist',
+                'control',
+                'hist',
+                'control',
+                'hist',
+                'control',
+                'hist',
+                'hist',
+                'HiSt',
+                'exp',
+            ],
+            'D': ['O2', 'O2', 'O2', 'O2', 'NO2', 'O2', 'O2', 'TA', 'tAs', 'UA'],
         }
     )
     query_model = QueryModel(
@@ -146,6 +160,10 @@ def test_search(query, require_all_on, expected):
     [
         (
             dict(variable=['A', 'C'], random='bz'),
+            [{'path': 'file2', 'variable': ['A', 'B', 'C'], 'attr': 2, 'random': {'bx', 'bz'}}],
+        ),
+        (
+            dict(variable=['A', 'C'], random='.*z'),
             [{'path': 'file2', 'variable': ['A', 'B', 'C'], 'attr': 2, 'random': {'bx', 'bz'}}],
         ),
         (

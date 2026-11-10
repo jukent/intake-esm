@@ -1,16 +1,25 @@
+from __future__ import annotations
+
 import datetime
 import enum
 import functools
 import json
 import os
 import typing
+import warnings
 
 import fsspec
 import pandas as pd
+import polars as pl
 import pydantic
 import tlz
+from pydantic import ConfigDict
+from typing_extensions import Self
 
 from ._search import search, search_apply_require_all_on
+
+__framereaders__ = [pl, pd]
+__filetypes__ = ['csv', 'csv.bz2', 'csv.gz', 'csv.zip', 'csv.xz', 'parquet']
 
 
 def _allnan_or_nonan(df, column: str) -> bool:
@@ -40,67 +49,58 @@ class AggregationType(str, enum.Enum):
     join_existing = 'join_existing'
     union = 'union'
 
-    class Config:
-        validate_all = True
-        validate_assignment = True
+    model_config = ConfigDict(validate_assignment=True)
 
 
 class DataFormat(str, enum.Enum):
     netcdf = 'netcdf'
     zarr = 'zarr'
+    zarr2 = 'zarr2'
+    zarr3 = 'zarr3'
     reference = 'reference'
+    opendap = 'opendap'
 
-    class Config:
-        validate_all = True
-        validate_assignment = True
+    model_config = ConfigDict(validate_assignment=True)
 
 
 class Attribute(pydantic.BaseModel):
     column_name: pydantic.StrictStr
     vocabulary: pydantic.StrictStr = ''
 
-    class Config:
-        validate_all = True
-        validate_assignment = True
+    model_config = ConfigDict(validate_assignment=True)
 
 
 class Assets(pydantic.BaseModel):
     column_name: pydantic.StrictStr
-    format: typing.Optional[DataFormat]
-    format_column_name: typing.Optional[pydantic.StrictStr]
+    format: DataFormat | None = None
+    format_column_name: pydantic.StrictStr | None = None
 
-    class Config:
-        validate_all = True
-        validate_assignment = True
+    model_config = ConfigDict(validate_assignment=True)
 
-    @pydantic.root_validator
-    def _validate_data_format(cls, values):
-        data_format, format_column_name = values.get('format'), values.get('format_column_name')
+    @pydantic.model_validator(mode='after')
+    def _validate_data_format(self) -> Self:
+        data_format, format_column_name = self.format, self.format_column_name
         if data_format is not None and format_column_name is not None:
             raise ValueError('Cannot set both format and format_column_name')
         elif data_format is None and format_column_name is None:
             raise ValueError('Must set one of format or format_column_name')
-        return values
+        return self
 
 
 class Aggregation(pydantic.BaseModel):
     type: AggregationType
     attribute_name: pydantic.StrictStr
-    options: typing.Optional[typing.Dict] = {}
+    options: dict = {}
 
-    class Config:
-        validate_all = True
-        validate_assignment = True
+    model_config = ConfigDict(validate_assignment=True)
 
 
 class AggregationControl(pydantic.BaseModel):
     variable_column_name: pydantic.StrictStr
-    groupby_attrs: typing.List[pydantic.StrictStr]
-    aggregations: typing.List[Aggregation] = []
+    groupby_attrs: list[pydantic.StrictStr]
+    aggregations: list[Aggregation] = []
 
-    class Config:
-        validate_all = True
-        validate_assignment = True
+    model_config = ConfigDict(validate_default=True, validate_assignment=True)
 
 
 class ESMCatalogModel(pydantic.BaseModel):
@@ -109,50 +109,56 @@ class ESMCatalogModel(pydantic.BaseModel):
     """
 
     esmcat_version: pydantic.StrictStr
-    attributes: typing.List[Attribute]
+    attributes: list[Attribute]
     assets: Assets
-    aggregation_control: typing.Optional[AggregationControl] = None
-    id: typing.Optional[str] = ''
-    catalog_dict: typing.Optional[typing.List[typing.Dict]] = None
-    catalog_file: pydantic.StrictStr = None
-    description: pydantic.StrictStr = None
-    title: pydantic.StrictStr = None
-    last_updated: typing.Optional[typing.Union[datetime.datetime, datetime.date]] = None
-    _df: typing.Optional[pd.DataFrame] = pydantic.PrivateAttr()
+    aggregation_control: AggregationControl | None = None
+    id: str = ''
+    catalog_dict: list[dict] | None = None
+    catalog_file: pydantic.StrictStr | None = None
+    description: pydantic.StrictStr | None = None
+    title: pydantic.StrictStr | None = None
+    last_updated: datetime.datetime | datetime.date | None = None
+    _df: pd.DataFrame | None = pydantic.PrivateAttr()
+    _frames: FramesModel | None = pydantic.PrivateAttr()
 
-    class Config:
-        arbitrary_types_allowed = True
-        underscore_attrs_are_private = True
-        validate_all = True
-        validate_assignment = True
+    model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True)
 
-    @pydantic.root_validator
-    def validate_catalog(cls, values):
-        catalog_dict, catalog_file = values.get('catalog_dict'), values.get('catalog_file')
+    @pydantic.model_validator(mode='after')
+    def validate_catalog(self) -> Self:
+        catalog_dict, catalog_file = self.catalog_dict, self.catalog_file
         if catalog_dict is not None and catalog_file is not None:
             raise ValueError('catalog_dict and catalog_file cannot be set at the same time')
 
-        return values
+        return self
+
+    def __setattr__(self, name, value):
+        """If we manually set _df, we need to propagate the change to _frames"""
+        if name == '_df':
+            self._frames = FramesModel(df=value)
+        return super().__setattr__(name, value)
 
     @classmethod
-    def from_dict(cls, data: typing.Dict) -> 'ESMCatalogModel':
+    def from_dict(cls, data: dict) -> ESMCatalogModel:
         esmcat = data['esmcat']
         df = data['df']
         if 'last_updated' not in esmcat:
             esmcat['last_updated'] = None
-        cat = cls.parse_obj(esmcat)
+        cat = cls.model_validate(esmcat)
         cat._df = df
+        cat._frames = FramesModel(df=df)
         return cat
 
     def save(
         self,
         name: str,
         *,
-        directory: str = None,
+        directory: str | None = None,
         catalog_type: str = 'dict',
-        to_csv_kwargs: dict = None,
-        json_dump_kwargs: dict = None,
-        storage_options: typing.Dict[str, typing.Any] = None,
+        file_format: str = 'csv',
+        write_kwargs: dict | None = None,
+        to_csv_kwargs: dict | None = None,
+        json_dump_kwargs: dict | None = None,
+        storage_options: dict[str, typing.Any] | None = None,
     ) -> None:
         """
         Save the catalog to a file.
@@ -167,8 +173,13 @@ class ESMCatalogModel(pydantic.BaseModel):
         catalog_type: str
             The type of catalog to save. Whether to save the catalog table as a dictionary
             in the JSON file or as a separate CSV file. Valid options are 'dict' and 'file'.
+        file_format: str
+            The file format to use when saving the catalog table. Either 'csv' or 'parquet'.
+            If catalog_type is 'dict', this parameter is ignored.
         to_csv_kwargs : dict, optional
-            Additional keyword arguments passed through to the :py:meth:`~pandas.DataFrame.to_csv` method.
+            Deprecated alias for ``write_kwargs``.
+        write_kwargs : dict, optional
+            Additional keyword arguments passed through to pandas CSV or Parquet writing.
         json_dump_kwargs : dict, optional
             Additional keyword arguments passed through to the :py:func:`~json.dump` function.
         storage_options: dict
@@ -182,9 +193,30 @@ class ESMCatalogModel(pydantic.BaseModel):
 
         """
 
+        if to_csv_kwargs is not None:
+            warnings.warn(
+                'to_csv_kwargs is deprecated and will be removed in a future version. '
+                'Please use write_kwargs instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if write_kwargs is not None:
+                raise ValueError(
+                    'Cannot provide both `to_csv_kwargs` and `write_kwargs`. '
+                    'Please use `write_kwargs`.'
+                )
+            write_kwargs = to_csv_kwargs
+
+        write_kwargs = write_kwargs or {}
+
         if catalog_type not in {'file', 'dict'}:
             raise ValueError(
                 f'catalog_type must be either "dict" or "file". Received catalog_type={catalog_type}'
+            )
+
+        if catalog_type == 'file' and file_format not in {'csv', 'parquet'}:
+            raise ValueError(
+                f'file_format must be either "csv" or "parquet". Received {file_format=}'
             )
 
         # Check if the directory is None, and if it is, set it to the current directory
@@ -192,44 +224,59 @@ class ESMCatalogModel(pydantic.BaseModel):
             directory = os.getcwd()
 
         # Configure the fsspec mapper and associated filenames
-        mapper = fsspec.get_mapper(f'{directory}', storage_options=storage_options)
+        storage_options = storage_options if storage_options is not None else {}
+        mapper = fsspec.get_mapper(f'{directory}', **storage_options)
         fs = mapper.fs
-        csv_file_name = f'{mapper.fs.protocol}://{mapper.root}/{name}.csv'
-        json_file_name = f'{mapper.fs.protocol}://{mapper.root}/{name}.json'
+        csv_file_name = fs.unstrip_protocol(f'{mapper.root}/{name}.csv')
+        json_file_name = fs.unstrip_protocol(f'{mapper.root}/{name}.json')
 
-        data = self.dict().copy()
+        data = self.model_dump().copy()
         for key in {'catalog_dict', 'catalog_file'}:
             data.pop(key, None)
         data['id'] = name
-        data['last_updated'] = datetime.datetime.now().utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+        data['last_updated'] = datetime.datetime.now(datetime.timezone.utc).strftime(
+            '%Y-%m-%dT%H:%M:%SZ'
+        )
+
+        _tmp_df = self.df.copy(deep=True)
+
+        # Iterable columns are held as tuples internally, but are always written out
+        # as lists, regardless of the bracket style in the original catalog file.
+        for colname in self.columns_with_iterables:
+            _tmp_df[colname] = _tmp_df[colname].astype(object).apply(list)
 
         if catalog_type == 'file':
-            csv_kwargs = {'index': False}
-            csv_kwargs.update(to_csv_kwargs or {})
-            compression = csv_kwargs.get('compression')
-            extensions = {'gzip': '.gz', 'bz2': '.bz2', 'zip': '.zip', 'xz': '.xz', None: ''}
-            csv_file_name = f'{csv_file_name}{extensions[compression]}'
-            data['catalog_file'] = str(csv_file_name)
-
-            with fs.open(csv_file_name, 'wb') as csv_outfile:
-                self.df.to_csv(csv_outfile, **csv_kwargs)
+            csv_kwargs: dict[str, typing.Any] = {'index': False}
+            csv_kwargs |= write_kwargs or {}
+            compression = csv_kwargs.get('compression', '')
+            extensions = {'gzip': '.gz', 'bz2': '.bz2', 'zip': '.zip', 'xz': '.xz'}
+            if file_format == 'csv':
+                csv_file_name = f'{csv_file_name}{extensions.get(compression, "")}'
+                data['catalog_file'] = str(csv_file_name)
+                with fs.open(csv_file_name, 'wb') as csv_outfile:
+                    _tmp_df.to_csv(csv_outfile, **csv_kwargs)
+            elif file_format == 'parquet':
+                pq_file_name = f'{csv_file_name.removesuffix(".csv")}.parquet'
+                data['catalog_file'] = str(pq_file_name)
+                with fs.open(pq_file_name, 'wb') as pq_outfile:
+                    _tmp_df.to_parquet(pq_outfile, **write_kwargs)
         else:
-            data['catalog_dict'] = self.df.to_dict(orient='records')
+            data['catalog_dict'] = _tmp_df.to_dict(orient='records')
 
         with fs.open(json_file_name, 'w') as outfile:
             json_kwargs = {'indent': 2}
-            json_kwargs.update(json_dump_kwargs or {})
-            json.dump(data, outfile, **json_kwargs)
+            json_kwargs |= json_dump_kwargs or {}
+            json.dump(data, outfile, **json_kwargs)  # type: ignore[arg-type]
 
         print(f'Successfully wrote ESM catalog json file to: {json_file_name}')
 
     @classmethod
     def load(
         cls,
-        json_file: typing.Union[str, pydantic.FilePath, pydantic.AnyUrl],
-        storage_options: typing.Dict[str, typing.Any] = None,
-        read_csv_kwargs: typing.Dict[str, typing.Any] = None,
-    ) -> 'ESMCatalogModel':
+        json_file: str | pydantic.FilePath | pydantic.AnyUrl,
+        storage_options: dict[str, typing.Any] | None = None,
+        read_kwargs: dict[str, typing.Any] | None = None,
+    ) -> ESMCatalogModel:
         """
         Loads the catalog from a file
 
@@ -240,12 +287,14 @@ class ESMCatalogModel(pydantic.BaseModel):
         storage_options: dict
             fsspec parameters passed to the backend file-system such as Google Cloud Storage,
             Amazon Web Service S3.
-        read_csv_kwargs: dict
-            Additional keyword arguments passed through to the :py:func:`~pandas.read_csv` function.
+        read_kwargs : dict, optional
+            Additional keyword arguments passed through to the :py:func:`~pandas.read_csv` function, if the
+            datastore is saved in csv format, or :py:func:`~pandas.read_parquet` if the datastore is saved in
+            parquet format.
 
         """
         storage_options = storage_options if storage_options is not None else {}
-        read_csv_kwargs = read_csv_kwargs or {}
+        read_kwargs = read_kwargs or {}
         json_file = str(json_file)  # We accept Path, but fsspec doesn't.
         _mapper = fsspec.get_mapper(json_file, **storage_options)
 
@@ -253,100 +302,124 @@ class ESMCatalogModel(pydantic.BaseModel):
             data = json.loads(fobj.read())
             if 'last_updated' not in data:
                 data['last_updated'] = None
-            cat = cls.parse_obj(data)
+            cat = cls.model_validate(data)
             if cat.catalog_file:
-                if _mapper.fs.exists(cat.catalog_file):
-                    csv_path = cat.catalog_file
-                else:
-                    csv_path = f'{os.path.dirname(_mapper.root)}/{cat.catalog_file}'
-                cat.catalog_file = csv_path
-                df = pd.read_csv(
-                    cat.catalog_file,
-                    storage_options=storage_options,
-                    **read_csv_kwargs,
-                )
+                cat._frames = cat._df_from_file(_mapper, storage_options, read_kwargs)
             else:
-                df = pd.DataFrame(cat.catalog_dict)
+                cat._frames = FramesModel(
+                    lf=pl.LazyFrame(cat.catalog_dict),
+                    pl_df=pl.DataFrame(cat.catalog_dict),
+                    df=pl.DataFrame(cat.catalog_dict).to_pandas(),
+                )
 
-            cat._df = df
-            cat._cast_agg_columns_with_iterables()
             return cat
 
+    def _df_from_file(
+        self,
+        _mapper: fsspec.FSMap,
+        storage_options: dict[str, typing.Any],
+        read_kwargs: dict[str, typing.Any],
+    ) -> FramesModel:
+        """
+        Read the catalog file from disk, falling back to pandas for bz2 files which
+        polars can't read.
+
+        Returns a FramesModel, which contains at least one of:
+        - a polars LazyFrame
+        - a polars DataFrame
+        - a pandas DataFrame
+
+        , as well as handling dataframe related methods, eg. columns_with_iterables.
+
+        Parameters
+        ----------
+        _mapper: fsspec mapper
+            A fsspec mapper object
+        storage_options: dict
+            fsspec parameters passed to the backend file-system such as Google Cloud Storage,
+            Amazon Web Service S3.
+        read_kwargs: dict
+            Additional keyword arguments passed through to the :py:func:`~pandas.read_csv` function.
+
+        Returns
+        -------
+        FramesModel:
+            A pydantic model containing at least one of a pandas/polars dataframe
+            and a polars lazyframe
+        """
+        if _mapper.fs.exists(self.catalog_file):
+            csv_path = self.catalog_file
+        else:
+            csv_path = f'{os.path.dirname(_mapper.root)}/{self.catalog_file}'
+        self.catalog_file = csv_path
+
+        reader = CatalogFileDataReader(self.catalog_file, storage_options, **read_kwargs)
+        return reader.frames
+
     @property
-    def columns_with_iterables(self) -> typing.Set[str]:
-        """Return a set of columns that have iterables."""
-        if self._df.empty:
-            return set()
-        has_iterables = (
-            self._df.sample(20, replace=True)
-            .applymap(type)
-            .isin([list, tuple, set])
-            .any()
-            .to_dict()
-        )
-        return {column for column, check in has_iterables.items() if check}
+    def lf(self) -> pl.LazyFrame:
+        """Return a `pl.LazyFrame` containing the catalog, creating it if necessary"""
+        return self._frames.lazy  # type: ignore[union-attr]
+
+    @property
+    def pl_df(self) -> pl.DataFrame:
+        """Return a `pl.DataFrame` containing the catalog, creating it if necessary"""
+        return self._frames.polars  # type: ignore[union-attr]
 
     @property
     def df(self) -> pd.DataFrame:
-        """Return the dataframe."""
-        return self._df
+        """Return the `pd.DataFrame` containing the catalog, creating it if necessary"""
+        return self._frames.pandas  # type: ignore[union-attr]
+
+    @property
+    def columns_with_iterables(self) -> set[str]:
+        """Return a set of columns that have iterables."""
+        return self._frames.columns_with_iterables  # type: ignore[union-attr]
 
     @property
     def has_multiple_variable_assets(self) -> bool:
         """Return True if the catalog has multiple variable assets."""
-        return self.aggregation_control.variable_column_name in self.columns_with_iterables
-
-    def _cast_agg_columns_with_iterables(self) -> None:
-        """Cast all agg_columns with iterables to tuple values so as
-        to avoid hashing issues (e.g. TypeError: unhashable type: 'list')
-        """
-        columns = list(
-            self.columns_with_iterables.intersection(
-                set(map(lambda agg: agg.attribute_name, self.aggregation_control.aggregations))
-            )
-        )
-        if columns:
-            self._df[columns] = self._df[columns].apply(tuple)
+        if self.aggregation_control:
+            return self.aggregation_control.variable_column_name in self.columns_with_iterables
+        return False
 
     @property
-    def grouped(self) -> typing.Union[pd.core.groupby.DataFrameGroupBy, pd.DataFrame]:
+    def grouped(self) -> pd.core.groupby.DataFrameGroupBy | pd.DataFrame:
+        cols = None
+        if self.aggregation_control:
+            if self.aggregation_control.groupby_attrs:
+                self.aggregation_control.groupby_attrs = list(
+                    filter(
+                        functools.partial(_allnan_or_nonan, self.df),
+                        self.aggregation_control.groupby_attrs,
+                    )
+                )
 
-        if self.aggregation_control.groupby_attrs:
-            self.aggregation_control.groupby_attrs = list(
+            if self.aggregation_control.groupby_attrs and set(
+                self.aggregation_control.groupby_attrs
+            ) != set(self.df.columns):
+                cols = self.aggregation_control.groupby_attrs
+        if cols is None:
+            cols = list(
                 filter(
                     functools.partial(_allnan_or_nonan, self.df),
-                    self.aggregation_control.groupby_attrs,
+                    self.df.columns,
                 )
             )
+        if len(cols) == 1:
+            cols = cols[0]
+        return self.df.groupby(cols)
 
-        if self.aggregation_control.groupby_attrs and set(
-            self.aggregation_control.groupby_attrs
-        ) != set(self.df.columns):
-            return self.df.groupby(self.aggregation_control.groupby_attrs)
-        return self.df
-
-    def _construct_group_keys(
-        self, sep: str = '.'
-    ) -> typing.Dict[str, typing.Union[str, typing.Tuple[str]]]:
-        grouped = self.grouped
-        if isinstance(grouped, pd.core.groupby.generic.DataFrameGroupBy):
-            internal_keys = grouped.groups.keys()
-            public_keys = map(
-                lambda key: key if isinstance(key, str) else sep.join(str(value) for value in key),
-                internal_keys,
-            )
-
-        else:
-            internal_keys = grouped.index
-            public_keys = (
-                grouped[grouped.columns.tolist()]
-                .apply(lambda row: sep.join(str(v) for v in row), axis=1)
-                .tolist()
-            )
+    def _construct_group_keys(self, sep: str = '.') -> dict[str, str | tuple[str]]:
+        internal_keys = self.grouped.groups.keys()
+        public_keys = map(
+            lambda key: key if isinstance(key, str) else sep.join(str(value) for value in key),
+            internal_keys,
+        )
 
         return dict(zip(public_keys, internal_keys))
 
-    def _unique(self) -> typing.Dict:
+    def _unique(self) -> dict:
         def _find_unique(series):
             values = series.dropna()
             if series.name in self.columns_with_iterables:
@@ -365,14 +438,15 @@ class ESMCatalogModel(pydantic.BaseModel):
 
     def nunique(self) -> pd.Series:
         """Return a series of the number of unique values for each column in the catalog."""
-        return pd.Series(tlz.valmap(len, self._unique()))
+
+        return self._frames.nunique()  # type: ignore[union-attr]
 
     def search(
         self,
         *,
-        query: typing.Union['QueryModel', typing.Dict[str, typing.Any]],
-        require_all_on: typing.Union[str, typing.List[str]] = None,
-    ) -> 'ESMCatalogModel':
+        query: QueryModel | dict[str, typing.Any],
+        require_all_on: str | list[str] | None = None,
+    ) -> pd.DataFrame:
         """
         Search for entries in the catalog.
 
@@ -417,34 +491,231 @@ class ESMCatalogModel(pydantic.BaseModel):
 class QueryModel(pydantic.BaseModel):
     """A Pydantic model to represent a query to be executed against a catalog."""
 
-    query: typing.Dict[pydantic.StrictStr, typing.Union[typing.Any, typing.List[typing.Any]]]
-    columns: typing.List[str]
-    require_all_on: typing.Union[str, typing.List[typing.Any]] = None
+    query: dict[pydantic.StrictStr, typing.Any | list[typing.Any]]
+    columns: list[str]
+    require_all_on: str | list[typing.Any] | None = None
 
-    class Config:
-        validate_all = True
-        validate_assignment = True
+    # TODO: Seem to be unable to modify fields in model_validator with
+    # validate_assignment=True since it leads to recursion
+    model_config = ConfigDict(validate_assignment=False)
 
-    @pydantic.root_validator(pre=False)
-    def validate_query(cls, values):
-        query = values.get('query', {})
-        columns = values.get('columns')
-        require_all_on = values.get('require_all_on', [])
+    @pydantic.model_validator(mode='after')
+    def validate_query(self) -> Self:
+        query = self.query
+        columns = self.columns
+        require_all_on = self.require_all_on
 
         if query:
             for key in query:
                 if key not in columns:
                     raise ValueError(f'Column {key} not in columns {columns}')
         if isinstance(require_all_on, str):
-            values['require_all_on'] = [require_all_on]
+            self.require_all_on = [require_all_on]
         if require_all_on is not None:
-            for key in values['require_all_on']:
+            for key in self.require_all_on:
                 if key not in columns:
                     raise ValueError(f'Column {key} not in columns {columns}')
         _query = query.copy()
         for key, value in _query.items():
-            if isinstance(value, (str, int, float, bool)):
+            if isinstance(value, str | int | float | bool) or value is None or value is pd.NA:
                 _query[key] = [value]
 
-        values['query'] = _query
-        return values
+        self.query = _query
+        return self
+
+
+class FramesModel(pydantic.BaseModel):
+    """A Pydantic model to represent our collection of dataframes - pandas, polars,
+    and lazyframe."""
+
+    df: pd.DataFrame | None = None
+    pl_df: pl.DataFrame | None = None
+    lf: pl.LazyFrame | None = None
+
+    model_config = ConfigDict(validate_assignment=True, arbitrary_types_allowed=True)
+
+    @pydantic.model_validator(mode='after')
+    def ensure_some(self) -> Self:
+        """
+        Make sure that at least one of the dataframes is not `None` when the model is
+        instantiated.
+        """
+        if self.df is None and self.pl_df is None and self.lf is None:
+            raise AssertionError('At least one of df, pl_df, or lf must be set')
+        return self
+
+    @property
+    def pandas(self) -> pd.DataFrame:
+        """Return the pandas DataFrame, instantiating it if necessary."""
+        if self.df is not None:
+            return self.df
+
+        if self.pl_df is not None:
+            self.df = self.pl_df.to_pandas(use_pyarrow_extension_array=True)
+            self.df[list(self.columns_with_iterables)] = self.df[
+                list(self.columns_with_iterables)
+            ].map(tuple)
+            return self.df
+
+        self.pl_df = self.lf.collect()  # type: ignore[union-attr]
+        self.df = self.pl_df.to_pandas(use_pyarrow_extension_array=True)
+        for colname in self.columns_with_iterables:
+            if self.df.dtypes[colname] == 'O':  # not for pyarrow list
+                self.df[colname] = self.df[colname].apply(tuple)
+        return self.df
+
+    @property
+    def polars(self) -> pl.DataFrame:
+        """Return the polars DataFrame, instantiating it if necessary."""
+        if self.pl_df is not None:
+            return self.pl_df
+
+        if self.lf is not None:
+            self.pl_df = self.lf.collect()
+            return self.pl_df
+
+        self.pl_df = pl.from_pandas(self.df)
+        self.lf = self.pl_df.lazy()
+
+        return self.pl_df
+
+    @property
+    def lazy(self) -> pl.LazyFrame:
+        """Return the polars LazyFrame, instantiating it if necessary."""
+        if self.lf is not None:
+            return self.lf
+
+        # Otherwise, it must be none - so lets create the lazyframe now. We use the
+        # self.polars property, so we can cascade to creating it from the pandas dataframe
+        # if necessary.
+        self.lf = self.polars.lazy()
+        return self.lf
+
+    @property
+    def columns_with_iterables(self) -> set[str]:
+        """Return a set of columns that have iterables, preferentially using
+        `self.lazy` > `self.polars` > `self.pandas` to minimise overhead."""
+        if (trunc_df := self.lazy.head(1).collect()).is_empty():
+            return set()
+        if self.df is not None and self.df.empty:
+            return set()
+
+        colnames, dtypes = trunc_df.columns, trunc_df.dtypes
+        return {colname for colname, dtype in zip(colnames, dtypes) if dtype == pl.List}
+
+    def nunique(self) -> pd.Series:
+        """Return a series of the number of unique values for each column in the catalog."""
+        return pd.Series(
+            {
+                colname: self.polars.get_column(colname).explode().n_unique()
+                if self.polars.schema[colname] == pl.List
+                else self.polars.get_column(colname).n_unique()
+                for colname in self.polars.columns
+            }
+        )
+
+
+class CatalogFileDataReader:
+    """Abstracts away some of the complexity related to reading dataframes"""
+
+    def __init__(
+        self,
+        catalog_file: pydantic.StrictStr | None,
+        storage_options: dict[str, typing.Any],
+        **read_kwargs,
+    ):
+        self.catalog_file = catalog_file
+        self.storage_options = storage_options
+        self.read_kwargs = read_kwargs
+
+        if self.catalog_file is None:
+            raise AssertionError('catalog_file must be set to a valid file path or URL')
+
+        # I think we want to replace this with a dict lookup.
+        if self.catalog_file.endswith('.csv.gz') or self.catalog_file.endswith('.csv'):
+            self.driver = 'polars'
+            self.filetype = 'csv'
+        elif self.catalog_file.endswith('.parquet'):
+            self.driver = 'polars'
+            self.filetype = 'parquet'
+        elif (
+            self.catalog_file.endswith('.csv.bz2')
+            or self.catalog_file.endswith('.csv.xz')
+            or self.catalog_file.endswith('.csv.zip')
+        ):
+            self.driver = 'pandas'
+            self.filetype = 'csv'
+        else:
+            raise ValueError(
+                f'Unsupported file type for catalog_file {self.catalog_file}. '
+                f'Expected one of {__filetypes__}'
+            )
+
+        self.frames = self._read()
+
+    def _read_csv_pd(self) -> FramesModel:
+        """Read a catalog file stored as a csv using pandas"""
+        df = pd.read_csv(
+            self.catalog_file,
+            storage_options=self.storage_options,
+            **self.read_kwargs,
+        )
+        return FramesModel(df=df)
+
+    def _read_csv_pl(self) -> FramesModel:
+        """Read a catalog file stored as a csv using polars"""
+        converters = self.read_kwargs.pop('converters', {})  # Hack
+        schema_overrides = self.read_kwargs.get('schema_overrides', {})
+        iterable_dtypes = {k: v for k, v in schema_overrides.items() if k in converters}
+        if iterable_dtypes:
+            self.read_kwargs['schema_overrides'] = {
+                k: v for k, v in schema_overrides.items() if k not in converters
+            }
+
+        lf = pl.scan_csv(
+            self.catalog_file,
+            storage_options=self.storage_options,
+            infer_schema=False,
+            **self.read_kwargs,
+        )
+
+        lf = lf.with_columns(
+            [
+                pl.col(colname)
+                .str.replace('^.', '[')  # Replace first/last chars with [ or ].
+                .str.replace('.$', ']')  # set/tuple => list
+                .str.replace(',]$', ']')  # Remove trailing commas
+                .str.replace_all(
+                    "'", '"'
+                )  # This is to do with the JSON spec- single versus double quotes
+                .str.json_decode(dtype=pl.List(pl.Utf8))
+                for colname in converters.keys()
+            ]
+        )
+        if iterable_dtypes:
+            lf = lf.with_columns([pl.col(k).cast(v) for k, v in iterable_dtypes.items()])
+        return FramesModel(lf=lf)
+
+    def _read_parquet_pl(self) -> FramesModel:
+        """Read a catalog file stored as a parquet using polars"""
+        lf = pl.scan_parquet(
+            self.catalog_file,  # type: ignore[arg-type]
+            storage_options=self.storage_options,
+            **self.read_kwargs,
+        )
+        return FramesModel(lf=lf)
+
+    def _read(self):
+        if self.driver == 'polars':
+            if self.filetype == 'csv':
+                return self._read_csv_pl()
+            elif self.filetype == 'parquet':
+                return self._read_parquet_pl()
+            else:
+                raise ValueError(f'Unsupported file type {self.filetype} for polars reader')
+
+        if self.driver == 'pandas':
+            if self.filetype == 'csv':
+                return self._read_csv_pd()
+            else:
+                raise ValueError(f'Unsupported file type {self.filetype} for pandas reader')

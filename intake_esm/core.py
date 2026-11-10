@@ -1,25 +1,33 @@
+import ast
 import concurrent.futures
+import os
 import typing
 import warnings
 from copy import deepcopy
 
 import dask
+import packaging.version
+import xarray as xr
 
 try:
-    from datatree import DataTree
-
+    if packaging.version.Version(xr.__version__) < packaging.version.Version('2024.10'):
+        from datatree import DataTree
+    else:
+        from xarray import DataTree
     _DATATREE_AVAILABLE = True
 except ImportError:
     _DATATREE_AVAILABLE = False
+import itables
 import pandas as pd
+import polars as pl
 import pydantic
-import xarray as xr
 from fastprogress.fastprogress import progress_bar
 from intake.catalog import Catalog
 
 from .cat import ESMCatalogModel
 from .derived import DerivedVariableRegistry, default_registry
 from .source import ESMDataSource
+from .utils import MinimalExploder
 
 
 class esm_datastore(Catalog):
@@ -30,7 +38,8 @@ class esm_datastore(Catalog):
 
     Parameters
     ----------
-    obj : str, dict
+    obj : str, dict, ESMCatalogModel
+        The ESM Catalog to use, or a path to a JSON file containing the catalog.
         If string, this must be a path or URL to an ESM catalog JSON file.
         If dict, this must be a dict representation of an ESM catalog.
         This dict must have two keys: 'esmcat' and 'df'. The 'esmcat' key must be a
@@ -40,8 +49,16 @@ class esm_datastore(Catalog):
         Delimiter to use when constructing a key for a query, by default '.'
     registry : DerivedVariableRegistry, optional
         Registry of derived variables to use, by default None. If not provided, uses the default registry.
+    read_kwargs : dict, optional
+        Additional keyword arguments passed through to the :py:func:`~polars.scan_csv` function, if the
+        datastore is saved in csv format, or :py:func:`~polars.scan_parquet` if the datastore is saved in
+        parquet format.
     read_csv_kwargs : dict, optional
-        Additional keyword arguments passed through to the :py:func:`~pandas.read_csv` function.
+        Deprecated alias for `read_kwargs`.
+    columns_with_iterables : list of str, optional
+        A list of columns in the csv file containing iterables. Values in columns specified here will be
+        converted with `ast.literal_eval` when :py:func:`~pandas.read_csv` is called (i.e., this is a
+        shortcut to passing converters to `read_kwargs`).
     storage_options : dict, optional
         Parameters passed to the backend file-system such as Google Cloud Storage,
         Amazon Web Service S3.
@@ -55,7 +72,7 @@ class esm_datastore(Catalog):
     can be accessed with `intake.open_esm_datastore()`:
 
     >>> import intake
-    >>> url = "https://storage.googleapis.com/cmip6/pangeo-cmip6.json"
+    >>> url = 'https://storage.googleapis.com/cmip6/pangeo-cmip6.json'
     >>> cat = intake.open_esm_datastore(url)
     >>> cat.df.head()
     activity_id institution_id source_id experiment_id  ... variable_id grid_label                                             zstore dcpp_init_year
@@ -71,27 +88,61 @@ class esm_datastore(Catalog):
 
     def __init__(
         self,
-        obj: typing.Union[pydantic.FilePath, pydantic.AnyUrl, typing.Dict[str, typing.Any]],
+        obj: pydantic.FilePath | pydantic.AnyUrl | dict[str, typing.Any] | ESMCatalogModel,
         *,
         progressbar: bool = True,
         sep: str = '.',
-        registry: typing.Optional[DerivedVariableRegistry] = None,
-        read_csv_kwargs: typing.Dict[str, typing.Any] = None,
-        storage_options: typing.Dict[str, typing.Any] = None,
-        **intake_kwargs: typing.Dict[str, typing.Any],
+        registry: DerivedVariableRegistry | None = None,
+        read_kwargs: dict[str, typing.Any] | None = None,
+        read_csv_kwargs: dict[str, typing.Any] | None = None,
+        columns_with_iterables: list[str] | None = None,
+        storage_options: dict[str, typing.Any] | None = None,
+        threaded: bool | None = None,
+        **intake_kwargs: dict[str, typing.Any],
     ):
-
         """Intake Catalog representing an ESM Collection."""
         super().__init__(**intake_kwargs)
         self.storage_options = storage_options or {}
-        self.read_csv_kwargs = read_csv_kwargs or {}
+
+        if read_csv_kwargs is not None:
+            warnings.warn(
+                'read_csv_kwargs is deprecated and will be removed in a future version. '
+                'Please use read_kwargs instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if read_kwargs is not None:
+                raise ValueError(
+                    'Cannot provide both `read_csv_kwargs` and `read_kwargs`. '
+                    'Please use `read_kwargs`.'
+                )
+            read_kwargs = read_csv_kwargs
+
+        read_kwargs = read_kwargs or {}
+        if columns_with_iterables:
+            converter = ast.literal_eval
+            read_kwargs.setdefault('converters', {})
+            for col in columns_with_iterables:
+                if read_kwargs['converters'].setdefault(col, converter) != converter:
+                    raise ValueError(
+                        f"Cannot provide converter for '{col}' via `read_kwargs` when '{col}' is also specified in `columns_with_iterables`"
+                    )
+        self.read_kwargs = read_kwargs
         self.progressbar = progressbar
         self.sep = sep
-        if isinstance(obj, dict):
+
+        if threaded is None:
+            self.threaded = ast.literal_eval(os.getenv('ITK_ESM_THREADING', 'True'))
+        else:
+            self.threaded = threaded
+
+        if isinstance(obj, ESMCatalogModel):
+            self.esmcat = obj
+        elif isinstance(obj, dict):
             self.esmcat = ESMCatalogModel.from_dict(obj)
         else:
             self.esmcat = ESMCatalogModel.load(
-                obj, storage_options=self.storage_options, read_csv_kwargs=read_csv_kwargs
+                obj, storage_options=self.storage_options, read_kwargs=read_kwargs
             )
 
         self.derivedcat = registry or default_registry
@@ -101,6 +152,10 @@ class esm_datastore(Catalog):
         self._validate_derivedcat()
 
     def _validate_derivedcat(self) -> None:
+        if self.esmcat.aggregation_control is None and len(self.derivedcat):
+            raise ValueError(
+                'Variable derivation requires `aggregation_control` to be specified in the catalog.'
+            )
         for key, entry in self.derivedcat.items():
             if self.esmcat.aggregation_control.variable_column_name not in entry.query.keys():
                 raise ValueError(
@@ -113,7 +168,7 @@ class esm_datastore(Catalog):
                         f'Derived variable {key} depends on unknown column {col} in query: {entry.query}. Valid ESM catalog columns: {self.esmcat.df.columns.tolist()}.'
                     )
 
-    def keys(self) -> typing.List[str]:
+    def keys(self) -> list[str]:
         """
         Get keys for the catalog entries
 
@@ -137,7 +192,7 @@ class esm_datastore(Catalog):
         --------
 
         >>> import intake
-        >>> cat = intake.open_esm_datastore("./tests/sample-catalogs/cesm1-lens-netcdf.json")
+        >>> cat = intake.open_esm_datastore('./tests/sample-catalogs/cesm1-lens-netcdf.json')
         >>> cat.keys_info()
                         component experiment stream
         key
@@ -149,10 +204,11 @@ class esm_datastore(Catalog):
 
         """
         results = self.esmcat._construct_group_keys(sep=self.sep)
-        data = {
-            key: dict(zip(self.esmcat.aggregation_control.groupby_attrs, results[key]))
-            for key in results
-        }
+        if self.esmcat.aggregation_control and self.esmcat.aggregation_control.groupby_attrs:
+            groupby_attrs = self.esmcat.aggregation_control.groupby_attrs
+        else:
+            groupby_attrs = list(self.df.columns)
+        data = {key: dict(zip(groupby_attrs, results[key])) for key in results}
         data = pd.DataFrame.from_dict(data, orient='index')
         data.index.name = 'key'
         return data
@@ -167,7 +223,7 @@ class esm_datastore(Catalog):
         str
           string template used to create catalog entry keys
         """
-        if self.esmcat.aggregation_control.groupby_attrs:
+        if self.esmcat.aggregation_control and self.esmcat.aggregation_control.groupby_attrs:
             return self.sep.join(self.esmcat.aggregation_control.groupby_attrs)
         else:
             return self.sep.join(self.esmcat.df.columns)
@@ -179,10 +235,40 @@ class esm_datastore(Catalog):
         """
         return self.esmcat.df
 
+    @property
+    def interactive(self) -> None:
+        """
+        Use itables to display the catalog in an interactive table. Use polars
+        for performance ideally. Fall back to pandas if not.
+
+        We have to explode columns with iterables, otherwise javascript stringifcation
+        can cause ellipsis to be rendered directly into the interactive table,
+        losing actual data and inserting junk.
+        """
+
+        try:
+            pl_df = self.esmcat._frames.polars  # type:ignore[union-attr]
+        except AttributeError:
+            pl_df = pl.from_pandas(self.df)
+
+        exploded_df = MinimalExploder(pl_df)()
+
+        return itables.show(
+            exploded_df,
+            search={'regex': True, 'caseInsensitive': True},
+            layout={'top1': 'searchPanes'},
+            searchPanes={
+                'layout': 'columns-3',
+                'cascadePanes': True,
+                'columns': [i for i, _ in enumerate(pl_df.columns)],
+            },
+            maxBytes=0,
+        )
+
     def __len__(self) -> int:
         return len(self.keys())
 
-    def _get_entries(self) -> typing.Dict[str, ESMDataSource]:
+    def _get_entries(self) -> dict[str, ESMDataSource]:
         # Due to just-in-time entry creation, we may not have all entries loaded
         # We need to make sure to create entries missing from self._entries
         missing = set(self.keys()) - set(self._entries.keys())
@@ -190,7 +276,7 @@ class esm_datastore(Catalog):
             _ = self[key]
         return self._entries
 
-    @pydantic.validate_arguments
+    @pydantic.validate_call
     def __getitem__(self, key: str) -> ESMDataSource:
         """
         This method takes a key argument and return a data source
@@ -214,8 +300,8 @@ class esm_datastore(Catalog):
 
         Examples
         --------
-        >>> cat = intake.open_esm_datastore("mycatalog.json")
-        >>> data_source = cat["AerChemMIP.BCC.BCC-ESM1.piClim-control.AERmon.gn"]
+        >>> cat = intake.open_esm_datastore('mycatalog.json')
+        >>> data_source = cat['AerChemMIP.BCC.BCC-ESM1.piClim-control.AERmon.gn']
         """
         # The canonical unique key is the key of a compatible group of assets
         try:
@@ -229,20 +315,26 @@ class esm_datastore(Catalog):
 
                 if isinstance(grouped, pd.DataFrame):
                     records = [grouped.loc[internal_key].to_dict()]
-
                 else:
                     records = grouped.get_group(internal_key).to_dict(orient='records')
 
+                if self.esmcat.aggregation_control:
+                    variable_column_name = self.esmcat.aggregation_control.variable_column_name
+                    aggregations = self.esmcat.aggregation_control.aggregations
+                else:
+                    variable_column_name = None
+                    aggregations = []
                 # Create a new entry
                 entry = ESMDataSource(
                     key=key,
                     records=records,
-                    variable_column_name=self.esmcat.aggregation_control.variable_column_name,
+                    variable_column_name=variable_column_name,
                     path_column_name=self.esmcat.assets.column_name,
                     data_format=self.esmcat.assets.format,
                     format_column_name=self.esmcat.assets.format_column_name,
-                    aggregations=self.esmcat.aggregation_control.aggregations,
+                    aggregations=aggregations,
                     intake_kwargs={'metadata': {}},
+                    threaded=self.threaded,
                 )
                 self._entries[key] = entry
                 return self._entries[key]
@@ -283,7 +375,7 @@ class esm_datastore(Catalog):
         contents = self._repr_html_()
         display(HTML(contents))
 
-    def __dir__(self) -> typing.List[str]:
+    def __dir__(self) -> list[str]:
         rv = [
             'df',
             'to_dataset_dict',
@@ -303,9 +395,11 @@ class esm_datastore(Catalog):
     def _ipython_key_completions_(self):
         return self.__dir__()
 
-    @pydantic.validate_arguments
+    @pydantic.validate_call
     def search(
-        self, require_all_on: typing.Union[str, typing.List[str]] = None, **query: typing.Any
+        self,
+        require_all_on: str | list[str] | None = None,
+        **query: typing.Any,
     ):
         """Search for entries in the catalog.
 
@@ -327,7 +421,7 @@ class esm_datastore(Catalog):
         Examples
         --------
         >>> import intake
-        >>> cat = intake.open_esm_datastore("pangeo-cmip6.json")
+        >>> cat = intake.open_esm_datastore('pangeo-cmip6.json')
         >>> cat.df.head(3)
         activity_id institution_id source_id  ... grid_label                                             zstore dcpp_init_year
         0  AerChemMIP            BCC  BCC-ESM1  ...         gn  gs://cmip6/AerChemMIP/BCC/BCC-ESM1/ssp370/r1i1...            NaN
@@ -335,11 +429,11 @@ class esm_datastore(Catalog):
         2  AerChemMIP            BCC  BCC-ESM1  ...         gn  gs://cmip6/AerChemMIP/BCC/BCC-ESM1/ssp370/r1i1...            NaN
 
         >>> sub_cat = cat.search(
-        ...     source_id=["BCC-CSM2-MR", "CNRM-CM6-1", "CNRM-ESM2-1"],
-        ...     experiment_id=["historical", "ssp585"],
-        ...     variable_id="pr",
-        ...     table_id="Amon",
-        ...     grid_label="gn",
+        ...     source_id=['BCC-CSM2-MR', 'CNRM-CM6-1', 'CNRM-ESM2-1'],
+        ...     experiment_id=['historical', 'ssp585'],
+        ...     variable_id='pr',
+        ...     table_id='Amon',
+        ...     grid_label='gn',
         ... )
         >>> sub_cat.df.head(3)
             activity_id institution_id    source_id  ... grid_label                                             zstore dcpp_init_year
@@ -352,7 +446,7 @@ class esm_datastore(Catalog):
 
         >>> import re
         >>> # Let's search for variables containing "Frac" in their name
-        >>> pat = re.compile(r"Frac")  # Define a regular expression
+        >>> pat = re.compile(r'Frac')  # Define a regular expression
         >>> cat.search(variable_id=pat)
         >>> cat.df.head().variable_id
         0     residualFrac
@@ -368,7 +462,10 @@ class esm_datastore(Catalog):
         # step 2: Search for entries required to derive variables in the derived catalogs
         # This requires a bit of a hack i.e. the user has to specify the variable in the query
         derivedcat_results = []
-        variables = query.pop(self.esmcat.aggregation_control.variable_column_name, None)
+        if self.esmcat.aggregation_control:
+            variables = query.pop(self.esmcat.aggregation_control.variable_column_name, None)
+        else:
+            variables = None
         dependents = []
         derived_cat_subset = {}
         if variables:
@@ -390,13 +487,10 @@ class esm_datastore(Catalog):
 
         if derivedcat_results:
             # Merge results from the main and the derived catalogs
-            esmcat_results = (
-                pd.concat([esmcat_results, *derivedcat_results])
-                .drop_duplicates()
-                .reset_index(drop=True)
-            )
+            esmcat_results = pd.concat([esmcat_results, *derivedcat_results])
+            esmcat_results = esmcat_results[~esmcat_results.astype(str).duplicated()]
 
-        cat = self.__class__({'esmcat': self.esmcat.dict(), 'df': esmcat_results})
+        cat = self.__class__({'esmcat': self.esmcat.model_dump(), 'df': esmcat_results})
         cat.esmcat.catalog_file = None  # Don't save the catalog file
         if self.esmcat.has_multiple_variable_assets:
             requested_variables = list(set(variables or []).union(dependents))
@@ -413,17 +507,19 @@ class esm_datastore(Catalog):
             cat.derivedcat = self.derivedcat
         return cat
 
-    @pydantic.validate_arguments
+    @pydantic.validate_call
     def serialize(
         self,
         name: pydantic.StrictStr,
-        directory: typing.Union[pydantic.DirectoryPath, pydantic.StrictStr] = None,
+        directory: pydantic.DirectoryPath | pydantic.StrictStr | None = None,
         catalog_type: str = 'dict',
-        to_csv_kwargs: typing.Dict[typing.Any, typing.Any] = None,
-        json_dump_kwargs: typing.Dict[typing.Any, typing.Any] = None,
-        storage_options: typing.Dict[str, typing.Any] = None,
+        file_format: str = 'csv',
+        write_kwargs: dict[typing.Any, typing.Any] | None = None,
+        to_csv_kwargs: dict[typing.Any, typing.Any] | None = None,
+        json_dump_kwargs: dict[typing.Any, typing.Any] | None = None,
+        storage_options: dict[str, typing.Any] | None = None,
     ) -> None:
-        """Serialize catalog to corresponding json and csv files.
+        """Serialize catalog to corresponding json and csv (or parquet) files.
 
         Parameters
         ----------
@@ -433,8 +529,14 @@ class esm_datastore(Catalog):
             The path to the local directory. If None, use the current directory
         catalog_type: str, default 'dict'
             Whether to save the catalog table as a dictionary in the JSON file or as a separate CSV file.
+        file_format: str, default 'csv'
+            The file format to use when saving the catalog table. Either 'csv' or 'parquet'.
+            If catalog_type is 'dict', this parameter is ignored.
+        write_kwargs: dict, optional
+            Additional keyword arguments passed through to the :py:func:`~pandas.DataFrame.to_csv` or
+            :py:func:`~pandas.DataFrame.to_parquet` functions.
         to_csv_kwargs : dict, optional
-            Additional keyword arguments passed through to the :py:meth:`~pandas.DataFrame.to_csv` method.
+            Deprecated alias for `write_kwargs`.
         json_dump_kwargs : dict, optional
             Additional keyword arguments passed through to the :py:func:`~json.dump` function.
         storage_options: dict
@@ -444,26 +546,43 @@ class esm_datastore(Catalog):
         Notes
         -----
         Large catalogs can result in large JSON files. To keep the JSON file size manageable, call with
-        `catalog_type='file'` to save catalog as a separate CSV file.
+        `catalog_type='file'` to save catalog as a separate CSV/parquet file.
 
         Examples
         --------
         >>> import intake
-        >>> cat = intake.open_esm_datastore("pangeo-cmip6.json")
+        >>> cat = intake.open_esm_datastore('pangeo-cmip6.json')
         >>> cat_subset = cat.search(
-        ...     source_id="BCC-ESM1",
-        ...     grid_label="gn",
-        ...     table_id="Amon",
-        ...     experiment_id="historical",
+        ...     source_id='BCC-ESM1',
+        ...     grid_label='gn',
+        ...     table_id='Amon',
+        ...     experiment_id='historical',
         ... )
-        >>> cat_subset.serialize(name="cmip6_bcc_esm1", catalog_type="file")
+        >>> cat_subset.serialize(name='cmip6_bcc_esm1', catalog_type='file')
         """
+
+        if to_csv_kwargs is not None:
+            warnings.warn(
+                'to_csv_kwargs is deprecated and will be removed in a future version. '
+                'Please use write_kwargs instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if write_kwargs is not None:
+                raise ValueError(
+                    'Cannot provide both `to_csv_kwargs` and `write_kwargs`. '
+                    'Please use `write_kwargs`.'
+                )
+            write_kwargs = to_csv_kwargs
+
+        write_kwargs = write_kwargs or {}
 
         self.esmcat.save(
             name,
             directory=directory,
             catalog_type=catalog_type,
-            to_csv_kwargs=to_csv_kwargs,
+            file_format=file_format,
+            write_kwargs=write_kwargs,
             json_dump_kwargs=json_dump_kwargs,
             storage_options=storage_options,
         )
@@ -475,7 +594,7 @@ class esm_datastore(Catalog):
         Examples
         --------
         >>> import intake
-        >>> cat = intake.open_esm_datastore("pangeo-cmip6.json")
+        >>> cat = intake.open_esm_datastore('pangeo-cmip6.json')
         >>> cat.nunique()
         activity_id          10
         institution_id       23
@@ -490,9 +609,10 @@ class esm_datastore(Catalog):
         dtype: int64
         """
         nunique = self.esmcat.nunique()
-        nunique[f'derived_{self.esmcat.aggregation_control.variable_column_name}'] = len(
-            self.derivedcat.keys()
-        )
+        if self.esmcat.aggregation_control:
+            nunique[f'derived_{self.esmcat.aggregation_control.variable_column_name}'] = len(
+                self.derivedcat.keys()
+            )
         return nunique
 
     def unique(self) -> pd.Series:
@@ -500,23 +620,25 @@ class esm_datastore(Catalog):
         catalog.
         """
         unique = self.esmcat.unique()
-        unique[f'derived_{self.esmcat.aggregation_control.variable_column_name}'] = list(
-            self.derivedcat.keys()
-        )
+        if self.esmcat.aggregation_control:
+            unique[f'derived_{self.esmcat.aggregation_control.variable_column_name}'] = list(
+                self.derivedcat.keys()
+            )
         return unique
 
-    @pydantic.validate_arguments
+    @pydantic.validate_call
     def to_dataset_dict(
         self,
-        xarray_open_kwargs: typing.Dict[str, typing.Any] = None,
-        xarray_combine_by_coords_kwargs: typing.Dict[str, typing.Any] = None,
-        preprocess: typing.Callable = None,
-        storage_options: typing.Dict[pydantic.StrictStr, typing.Any] = None,
-        progressbar: pydantic.StrictBool = None,
-        aggregate: pydantic.StrictBool = None,
+        xarray_open_kwargs: dict[str, typing.Any] | None = None,
+        xarray_combine_by_coords_kwargs: dict[str, typing.Any] | None = None,
+        preprocess: typing.Callable | None = None,
+        storage_options: dict[pydantic.StrictStr, typing.Any] | None = None,
+        progressbar: pydantic.StrictBool | None = None,
+        aggregate: pydantic.StrictBool | None = None,
         skip_on_error: pydantic.StrictBool = False,
+        threaded: bool | None = None,
         **kwargs,
-    ) -> typing.Dict[str, xr.Dataset]:
+    ) -> dict[str, xr.Dataset]:
         """
         Load catalog entries into a dictionary of xarray datasets.
 
@@ -542,7 +664,11 @@ class esm_datastore(Catalog):
             If False, no aggregation will be done.
         skip_on_error : bool, optional
             If True, skip datasets that cannot be loaded and/or variables we are unable to derive.
-
+        threaded : bool, optional
+            If True, use :py:func:`dask.compute` to load datasets in parallel. If False, load datasets sequentially.
+            If None, the environment variable `ITK_ESM_THREADING` will be used to determine the threading behavior,
+            defaulting to True if the variable is not set. If a value is provided, it will override the environment
+            variable determined default.
         Returns
         -------
         dsets : dict
@@ -551,18 +677,18 @@ class esm_datastore(Catalog):
         Examples
         --------
         >>> import intake
-        >>> cat = intake.open_esm_datastore("glade-cmip6.json")
+        >>> cat = intake.open_esm_datastore('glade-cmip6.json')
         >>> sub_cat = cat.search(
-        ...     source_id=["BCC-CSM2-MR", "CNRM-CM6-1", "CNRM-ESM2-1"],
-        ...     experiment_id=["historical", "ssp585"],
-        ...     variable_id="pr",
-        ...     table_id="Amon",
-        ...     grid_label="gn",
+        ...     source_id=['BCC-CSM2-MR', 'CNRM-CM6-1', 'CNRM-ESM2-1'],
+        ...     experiment_id=['historical', 'ssp585'],
+        ...     variable_id='pr',
+        ...     table_id='Amon',
+        ...     grid_label='gn',
         ... )
         >>> dsets = sub_cat.to_dataset_dict()
         >>> dsets.keys()
         dict_keys(['CMIP.BCC.BCC-CSM2-MR.historical.Amon.gn', 'ScenarioMIP.BCC.BCC-CSM2-MR.ssp585.Amon.gn'])
-        >>> dsets["CMIP.BCC.BCC-CSM2-MR.historical.Amon.gn"]
+        >>> dsets['CMIP.BCC.BCC-CSM2-MR.historical.Amon.gn']
         <xarray.Dataset>
         Dimensions:    (bnds: 2, lat: 160, lon: 320, member_id: 3, time: 1980)
         Coordinates:
@@ -588,13 +714,19 @@ class esm_datastore(Catalog):
             return {}
 
         if (
-            self.esmcat.aggregation_control.variable_column_name
-            in self.esmcat.aggregation_control.groupby_attrs
-        ) and len(self.derivedcat) > 0:
+            self.esmcat.aggregation_control
+            and (
+                self.esmcat.aggregation_control.variable_column_name
+                in self.esmcat.aggregation_control.groupby_attrs
+            )
+            and len(self.derivedcat) > 0
+        ):
             raise NotImplementedError(
                 f'The `{self.esmcat.aggregation_control.variable_column_name}` column name is used as a groupby attribute: {self.esmcat.aggregation_control.groupby_attrs}. '
                 'This is not yet supported when computing derived variables.'
             )
+
+        threaded = _get_threaded(threaded)
 
         xarray_open_kwargs = xarray_open_kwargs or {}
         xarray_combine_by_coords_kwargs = xarray_combine_by_coords_kwargs or {}
@@ -618,9 +750,10 @@ class esm_datastore(Catalog):
             preprocess=preprocess,
             requested_variables=self._requested_variables,
             storage_options=storage_options,
+            threaded=threaded,
         )
 
-        if aggregate is not None and not aggregate:
+        if aggregate is not None and not aggregate and self.esmcat.aggregation_control:
             self = deepcopy(self)
             self.esmcat.aggregation_control.groupby_attrs = []
         if progressbar is not None:
@@ -651,16 +784,17 @@ class esm_datastore(Catalog):
         self.datasets = self._create_derived_variables(datasets, skip_on_error)
         return self.datasets
 
-    @pydantic.validate_arguments
+    @pydantic.validate_call
     def to_datatree(
         self,
-        xarray_open_kwargs: typing.Dict[str, typing.Any] = None,
-        xarray_combine_by_coords_kwargs: typing.Dict[str, typing.Any] = None,
-        preprocess: typing.Callable = None,
-        storage_options: typing.Dict[pydantic.StrictStr, typing.Any] = None,
-        progressbar: pydantic.StrictBool = None,
-        aggregate: pydantic.StrictBool = None,
+        xarray_open_kwargs: dict[str, typing.Any] | None = None,
+        xarray_combine_by_coords_kwargs: dict[str, typing.Any] | None = None,
+        preprocess: typing.Callable | None = None,
+        storage_options: dict[pydantic.StrictStr, typing.Any] | None = None,
+        progressbar: pydantic.StrictBool | None = None,
+        aggregate: pydantic.StrictBool | None = None,
         skip_on_error: pydantic.StrictBool = False,
+        levels: list[str] = None,
         **kwargs,
     ):
         """
@@ -684,6 +818,9 @@ class esm_datastore(Catalog):
             If False, no aggregation will be done.
         skip_on_error : bool, optional
             If True, skip datasets that cannot be loaded and/or variables we are unable to derive.
+        levels : list[str], optional
+            List of fields to use as the datatree nodes. WARNING: This will overwrite the fields
+            used to create the unique aggregation keys.
 
         Returns
         -------
@@ -693,16 +830,16 @@ class esm_datastore(Catalog):
         Examples
         --------
         >>> import intake
-        >>> cat = intake.open_esm_datastore("glade-cmip6.json")
+        >>> cat = intake.open_esm_datastore('glade-cmip6.json')
         >>> sub_cat = cat.search(
-        ...     source_id=["BCC-CSM2-MR", "CNRM-CM6-1", "CNRM-ESM2-1"],
-        ...     experiment_id=["historical", "ssp585"],
-        ...     variable_id="pr",
-        ...     table_id="Amon",
-        ...     grid_label="gn",
+        ...     source_id=['BCC-CSM2-MR', 'CNRM-CM6-1', 'CNRM-ESM2-1'],
+        ...     experiment_id=['historical', 'ssp585'],
+        ...     variable_id='pr',
+        ...     table_id='Amon',
+        ...     grid_label='gn',
         ... )
         >>> dsets = sub_cat.to_datatree()
-        >>> dsets["CMIP/BCC.BCC-CSM2-MR/historical/Amon/gn"].ds
+        >>> dsets['CMIP/BCC.BCC-CSM2-MR/historical/Amon/gn'].ds
         <xarray.Dataset>
         Dimensions:    (bnds: 2, lat: 160, lon: 320, member_id: 3, time: 1980)
         Coordinates:
@@ -724,6 +861,11 @@ class esm_datastore(Catalog):
                 'To proceed please install xarray-datatree using: '
                 ' `python -m pip install xarray-datatree` or `conda install -c conda-forge xarray-datatree`.'
             )
+
+        # Change the groupby controls if neccessary, used to assemble the tree
+        if levels is not None:
+            self = deepcopy(self)
+            self.esmcat.aggregation_control.groupby_attrs = levels
 
         # Set the separator to a / for datatree temporarily
         self.sep, old_sep = '/', self.sep
@@ -763,16 +905,26 @@ class esm_datastore(Catalog):
         :py:class:`~xarray.Dataset`
         """
         if len(self) != 1:  # quick check to fail more quickly if there are many results
+            lens = self._aggr_lengths
             raise ValueError(
-                f'Expected exactly one dataset. Received {len(self)} datasets. Please refine your search or use `.to_dataset_dict()`.'
+                f'Expected exactly one dataset. Received {len(self)} datasets. Please refine your search on {", ".join(lens.keys())} or use `.to_dataset_dict()`.'
             )
         res = self.to_dataset_dict(**{**kwargs, 'progressbar': False})
         if len(res) != 1:  # extra check in case kwargs did modify something
+            lens = self._aggr_lengths
             raise ValueError(
-                f'Expected exactly one dataset. Received {len(self)} datasets. Please refine your search or use `.to_dataset_dict()`.'
+                f'Expected exactly one dataset. Received {len(self)} datasets. Please refine your search on {", ".join(lens.keys())} or use `.to_dataset_dict()`.'
             )
         _, ds = res.popitem()
         return ds
+
+    @property
+    def _aggr_lengths(self) -> dict[str, int]:
+        """
+        For groupby attrs that have more than one unique value, return their name and length
+        """
+        lens = {k: len(self.unique()[k]) for k in self.esmcat.aggregation_control.groupby_attrs}
+        return {k: v for k, v in lens.items() if v > 1}
 
     def _create_derived_variables(self, datasets, skip_on_error):
         if len(self.derivedcat) > 0:
@@ -786,3 +938,18 @@ class esm_datastore(Catalog):
 
 def _load_source(key, source):
     return key, source.to_dask()
+
+
+def _get_threaded(threaded: bool | None) -> bool:
+    """
+    Read the threading option from the environment variable & passed value
+    """
+    if threaded is None:
+        try:
+            threaded = ast.literal_eval(os.getenv('ITK_ESM_THREADING', 'True'))
+        except ValueError as e:
+            raise ValueError(
+                'The environment variable ITK_ESM_THREADING must be a boolean, if set.'
+            ) from e
+
+    return threaded

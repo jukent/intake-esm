@@ -1,5 +1,149 @@
 # Changelog
 
+[Full Changelog](https://github.com/intake/intake-esm/compare/v2025.2.3...v2025.7.9)
+
+## v2025.7.9
+
+### New features added
+
+- Support Python313, add setuptools to requirements by @Zeitsperre in https://github.com/intake/intake-esm/pull/707
+- Load with polars by @charles-turner-1 in https://github.com/intake/intake-esm/pull/709
+- Add interactive view of catalog by @charles-turner-1 in https://github.com/intake/intake-esm/pull/723
+
+### Bugs fixed
+
+- Fixed bug where pyarrow conversions were causing string accessor to fail in search by @charles-turner-1 in https://github.com/intake/intake-esm/pull/718
+
+### Maintenance and upkeep improvements
+
+- Update default argument for decode_timedelta by @charles-turner-1 in https://github.com/intake/intake-esm/pull/706
+- 697- Fix segfault by @charles-turner-1 in https://github.com/intake/intake-esm/pull/712
+- Fix broken `require_all_on` example in docs by @charles-turner-1 in https://github.com/intake/intake-esm/pull/720
+- Improve test performance by @charles-turner-1 in https://github.com/intake/intake-esm/pull/719
+
+### Other merged PRs
+
+- Bump codecov/codecov-action from 5.3.1 to 5.4.0 in the actions group by @dependabot in https://github.com/intake/intake-esm/pull/703
+- [pre-commit.ci] pre-commit autoupdate by @pre-commit-ci in https://github.com/intake/intake-esm/pull/704
+- Remove setuptools runtime requirements by @Zeitsperre in https://github.com/intake/intake-esm/pull/708
+- [pre-commit.ci] pre-commit autoupdate by @pre-commit-ci in https://github.com/intake/intake-esm/pull/713
+- [pre-commit.ci] pre-commit autoupdate by @pre-commit-ci in https://github.com/intake/intake-esm/pull/716
+- Bump codecov/codecov-action from 5.4.0 to 5.4.2 in the actions group by @dependabot in https://github.com/intake/intake-esm/pull/714
+- Bump codecov/codecov-action from 5.4.2 to 5.4.3 in the actions group by @dependabot in https://github.com/intake/intake-esm/pull/721
+- [pre-commit.ci] pre-commit autoupdate by @pre-commit-ci in https://github.com/intake/intake-esm/pull/722
+- [pre-commit.ci] pre-commit autoupdate by @pre-commit-ci in https://github.com/intake/intake-esm/pull/726
+
+### New Contributors
+
+- @Zeitsperre made their first contribution in https://github.com/intake/intake-esm/pull/707
+
+## v2025.2.3
+
+[Full Changelog](https://github.com/intake/intake-esm/compare/v2024.2.6...v2025.2.3)
+
+### New features added
+
+- Changed behaviour of `source._open_dataset` to include coordinate variables by @charles-turner-1 in https://github.com/intake/intake-esm/pull/681
+- feat: Support being able to use in-memory ESMCatalogModel instances by @lewisjared in https://github.com/intake/intake-esm/pull/690
+
+### Bugs fixed
+
+- Fix #684 Merge results from main and derived catalogs by @rbeucher in https://github.com/intake/intake-esm/pull/685
+- Fix how storage_options is passed to get_mapper by @garciampred in https://github.com/intake/intake-esm/pull/678
+
+### Maintenance and upkeep improvements
+
+- Upgrade to intake Take2 by @charles-turner-1 in https://github.com/intake/intake-esm/pull/683
+- Update dependencies and improve import handling for xarray version compatibility by @andersy005 in https://github.com/intake/intake-esm/pull/696
+- Update pyproject.toml and readthedocs.yml by @andersy005 in https://github.com/intake/intake-esm/pull/695
+- Add flaky decorator for tests with remote resources to reduce cold start failure rate by @charles-turner-1 in https://github.com/intake/intake-esm/pull/700
+- Update CONTRIBUTING guidelines to e.g. refer to new default branch by @sadielbartholomew in https://github.com/intake/intake-esm/pull/674
+
+### Other merged PRs
+
+- Bump the actions group with 16 updates by @dependabot in https://github.com/intake/intake-esm/pull/658, https://github.com/intake/intake-esm/pull/654, https://github.com/intake/intake-esm/pull/661, https://github.com/intake/intake-esm/pull/671, https://github.com/intake/intake-esm/pull/686, https://github.com/intake/intake-esm/pull/691, https://github.com/intake/intake-esm/pull/693, https://github.com/intake/intake-esm/pull/698
+- Update PyPI workflow to build and upload intake-esm artifacts by @andersy005 in https://github.com/intake/intake-esm/pull/659
+- [pre-commit.ci] pre-commit autoupdate by @pre-commit-ci in https://github.com/intake/intake-esm/pull/662, https://github.com/intake/intake-esm/pull/664, https://github.com/intake/intake-esm/pull/669, https://github.com/intake/intake-esm/pull/672, https://github.com/intake/intake-esm/pull/675, https://github.com/intake/intake-esm/pull/677, https://github.com/intake/intake-esm/pull/682, https://github.com/intake/intake-esm/pull/687, https://github.com/intake/intake-esm/pull/692, https://github.com/intake/intake-esm/pull/694
+- Bump codecov/codecov-action from 4.1.1 to 4.4.1 in the actions group by @dependabot in https://github.com/intake/intake-esm/pull/663,https://github.com/intake/intake-esm/pull/668
+- Bump pypa/gh-action-pypi-publish from 1.9.0 to 1.10.2 in the actions group by @dependabot in https://github.com/intake/intake-esm/pull/676, https://github.com/intake/intake-esm/pull/680
+
+### New Contributors
+
+- @sadielbartholomew made their first contribution in https://github.com/intake/intake-esm/pull/674
+- @garciampred made their first contribution in https://github.com/intake/intake-esm/pull/678
+- @charles-turner-1 made their first contribution in https://github.com/intake/intake-esm/pull/681
+- @rbeucher made their first contribution in https://github.com/intake/intake-esm/pull/685
+- @lewisjared made their first contribution in https://github.com/intake/intake-esm/pull/690
+
+## v2024.2.6
+
+([full changelog](https://github.com/intake/intake-esm/compare/v2023.10.27...d96efea14b348e346d5c2a1490e91c9ae1e2c709))
+
+### Bugs fixed
+
+- FIX: Pin older versions of sphinx to fix docs [#646](https://github.com/intake/intake-esm/pull/646) ([@mgrover1](https://github.com/mgrover1))
+
+### Other merged PRs
+
+- Update Dependabot configuration [#653](https://github.com/intake/intake-esm/pull/653) ([@andersy005](https://github.com/andersy005))
+- Drop python 3.9 [#652](https://github.com/intake/intake-esm/pull/652) ([@andersy005](https://github.com/andersy005))
+- Pin intake to `<v2` [#651](https://github.com/intake/intake-esm/pull/651) ([@andersy005](https://github.com/andersy005))
+- Bump codecov/codecov-action from 3.1.4 to 4.0.0 [#648](https://github.com/intake/intake-esm/pull/648) ([@dependabot](https://github.com/dependabot))
+- [pre-commit.ci] pre-commit autoupdate [#645](https://github.com/intake/intake-esm/pull/645) ([@pre-commit-ci](https://github.com/pre-commit-ci))
+- Bump actions/setup-python from 4 to 5 [#644](https://github.com/intake/intake-esm/pull/644) ([@dependabot](https://github.com/dependabot))
+- replace black/flake/isort with ruff-format [#643](https://github.com/intake/intake-esm/pull/643) ([@andersy005](https://github.com/andersy005))
+- [pre-commit.ci] pre-commit autoupdate [#642](https://github.com/intake/intake-esm/pull/642) ([@pre-commit-ci](https://github.com/pre-commit-ci))
+- Bump pypa/gh-action-pypi-publish from 1.8.10 to 1.8.11 [#641](https://github.com/intake/intake-esm/pull/641) ([@dependabot](https://github.com/dependabot))
+- [pre-commit.ci] pre-commit autoupdate [#640](https://github.com/intake/intake-esm/pull/640) ([@pre-commit-ci](https://github.com/pre-commit-ci))
+- Replace applymap with map [#639](https://github.com/intake/intake-esm/pull/639) ([@dougiesquire](https://github.com/dougiesquire))
+- Update-changelog [#638](https://github.com/intake/intake-esm/pull/638) ([@andersy005](https://github.com/andersy005))
+- ADD: Add ci support for python 3.12 [#634](https://github.com/intake/intake-esm/pull/634) ([@mgrover1](https://github.com/mgrover1))
+
+### Contributors to this release
+
+([GitHub contributors page for this release](https://github.com/intake/intake-esm/graphs/contributors?from=2023-10-27&to=2024-02-06&type=c))
+
+[@andersy005](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Aandersy005+updated%3A2023-10-27..2024-02-06&type=Issues) | [@dependabot](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Adependabot+updated%3A2023-10-27..2024-02-06&type=Issues) | [@dougiesquire](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Adougiesquire+updated%3A2023-10-27..2024-02-06&type=Issues) | [@mgrover1](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Amgrover1+updated%3A2023-10-27..2024-02-06&type=Issues) | [@pre-commit-ci](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Apre-commit-ci+updated%3A2023-10-27..2024-02-06&type=Issues)
+
+## v2023.10.27
+
+([full changelog](https://github.com/intake/intake-esm/compare/v2023.07.07...487e3149679ff1c67a4af75d9e9a6ff72f64f028))
+
+### New features added
+
+- ADD: Add levels option to to_datatree() [#624](https://github.com/intake/intake-esm/pull/624) ([@mgrover1](https://github.com/mgrover1))
+
+### Enhancements made
+
+- ADD: Add levels option to to_datatree() [#624](https://github.com/intake/intake-esm/pull/624) ([@mgrover1](https://github.com/mgrover1))
+
+### Other merged PRs
+
+- Fix catalog serialization with fsspec 2023.10.0 [#636](https://github.com/intake/intake-esm/pull/636) ([@aulemahal](https://github.com/aulemahal))
+- [pre-commit.ci] pre-commit autoupdate [#631](https://github.com/intake/intake-esm/pull/631) ([@pre-commit-ci](https://github.com/pre-commit-ci))
+- Bump actions/checkout from 3 to 4 [#630](https://github.com/intake/intake-esm/pull/630) ([@dependabot](https://github.com/dependabot))
+- [pre-commit.ci] pre-commit autoupdate [#628](https://github.com/intake/intake-esm/pull/628) ([@pre-commit-ci](https://github.com/pre-commit-ci))
+- Bump pypa/gh-action-pypi-publish from 1.8.8 to 1.8.10 [#627](https://github.com/intake/intake-esm/pull/627) ([@dependabot](https://github.com/dependabot))
+- [pre-commit.ci] pre-commit autoupdate [#626](https://github.com/intake/intake-esm/pull/626) ([@pre-commit-ci](https://github.com/pre-commit-ci))
+- Bump pypa/gh-action-pypi-publish from 1.8.7 to 1.8.8 [#625](https://github.com/intake/intake-esm/pull/625) ([@dependabot](https://github.com/dependabot))
+- Updates for pydantic v2 [#619](https://github.com/intake/intake-esm/pull/619) ([@dougiesquire](https://github.com/dougiesquire))
+- [pre-commit.ci] pre-commit autoupdate [#618](https://github.com/intake/intake-esm/pull/618) ([@pre-commit-ci](https://github.com/pre-commit-ci))
+
+### Contributors to this release
+
+([GitHub contributors page for this release](https://github.com/intake/intake-esm/graphs/contributors?from=2023-07-07&to=2023-10-27&type=c))
+
+[@andersy005](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Aandersy005+updated%3A2023-07-07..2023-10-27&type=Issues) | [@aulemahal](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Aaulemahal+updated%3A2023-07-07..2023-10-27&type=Issues) | [@dcherian](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Adcherian+updated%3A2023-07-07..2023-10-27&type=Issues) | [@dependabot](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Adependabot+updated%3A2023-07-07..2023-10-27&type=Issues) | [@dougiesquire](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Adougiesquire+updated%3A2023-07-07..2023-10-27&type=Issues) | [@jbusecke](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Ajbusecke+updated%3A2023-07-07..2023-10-27&type=Issues) | [@mgrover1](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Amgrover1+updated%3A2023-07-07..2023-10-27&type=Issues) | [@pre-commit-ci](https://github.com/search?q=repo%3Aintake%2Fintake-esm+involves%3Apre-commit-ci+updated%3A2023-07-07..2023-10-27&type=Issues)
+
+## v2023.07.07
+
+### New features added
+
+- Fix the link to documentation build status [#591](https://github.com/intake/intake-esm/pull/591) ([@mgrover1](https://github.com/mgrover1))
+- Add optional `columns_with_iterables` argument to `esm_datastore` [#589](https://github.com/intake/intake-esm/pull/589) ([@dougiesquire](https://github.com/dougiesquire))
+- Add `opendap` as a possible data format [#570](https://github.com/intake/intake-esm/pull/570) ([@aulemahal](https://github.com/aulemahal))
+- Fix for catalogs without `aggregation_control`, as allowed by the ESM catalog specification [#569](https://github.com/intake/intake-esm/pull/569) ([@aulemahal](https://github.com/aulemahal))
+
 ## v2022.9.18
 
 ([full changelog](https://github.com/intake/intake-esm/compare/v2021.8.17...3e959d126663f9b8415528bfcee575967c3ef0c1))
@@ -615,7 +759,6 @@
 
 - Fix CESM-LE ice component peculiarities that caused intake-esm to load data improperly.
   The fix separates variables for `ice` component into two separate components:
-
   - `ice_sh`: for southern hemisphere
   - `ice_nh`: for northern hemisphere
 

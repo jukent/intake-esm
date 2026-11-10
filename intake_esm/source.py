@@ -1,14 +1,20 @@
 import typing
+import warnings
 
 import dask
 import fsspec
+import packaging.version
 import pandas as pd
 import pydantic
 import xarray as xr
 from intake.source.base import DataSource, Schema
 
 from .cat import Aggregation, DataFormat
-from .utils import OPTIONS
+from .utils import OPTIONS, _set_async_flag
+
+
+class ConcatenationWarning(UserWarning):
+    pass
 
 
 class ESMDataSourceError(Exception):
@@ -16,11 +22,16 @@ class ESMDataSourceError(Exception):
 
 
 def _get_xarray_open_kwargs(data_format, xarray_open_kwargs=None, storage_options=None):
+    _can_autochunk_cftime = packaging.version.Version(xr.__version__) >= packaging.version.Version(
+        '2025.11.0'
+    )
+
     xarray_open_kwargs = (xarray_open_kwargs or {}).copy()
     _default_open_kwargs = {
-        'engine': 'zarr' if data_format in {'zarr', 'reference'} else 'netcdf4',
-        'chunks': {},
+        'engine': 'zarr' if data_format in {'zarr', 'zarr2', 'zarr3', 'reference'} else 'netcdf4',
+        'chunks': 'auto' if _can_autochunk_cftime else {},
         'backend_kwargs': {},
+        'decode_timedelta': False,
     }
     xarray_open_kwargs = (
         {**_default_open_kwargs, **xarray_open_kwargs}
@@ -28,15 +39,38 @@ def _get_xarray_open_kwargs(data_format, xarray_open_kwargs=None, storage_option
         else _default_open_kwargs
     )
 
+    # Add options to backend kwargs as we delegate all this to Zarr
+    # however, don't add options if none are passed. Zarr will raise
+    # if non-none options are passed for local assets
     if (
         xarray_open_kwargs['engine'] == 'zarr'
         and 'storage_options' not in xarray_open_kwargs['backend_kwargs']
+        and storage_options
     ):
-        xarray_open_kwargs['backend_kwargs']['storage_options'] = {} or storage_options
+        xarray_open_kwargs['backend_kwargs']['storage_options'] = storage_options
+
+    xarray_open_kwargs = _set_async_flag(data_format, xarray_open_kwargs)
+
     return xarray_open_kwargs
 
 
+def _get_open_func(threaded: bool) -> typing.Callable:
+    """Return the appropriate open function based on threading"""
+    if threaded:
+        return _delayed_open_ds
+    else:
+        return _eager_open_ds
+
+
+def _eager_open_ds(*args, **kwargs):
+    return _open_dataset(*args, **kwargs)
+
+
 @dask.delayed
+def _delayed_open_ds(*args, **kwargs):
+    return _open_dataset(*args, **kwargs)
+
+
 def _open_dataset(
     urlpath,
     varname,
@@ -47,30 +81,40 @@ def _open_dataset(
     additional_attrs=None,
     expand_dims=None,
     data_format=None,
+    storage_options=None,
 ):
+    storage_options = storage_options or xarray_open_kwargs.get('backend_kwargs', {}).get(
+        'storage_options', {}
+    )
 
-    storage_options = xarray_open_kwargs.get('backend_kwargs', {}).get('storage_options', {})
     # Support kerchunk datasets, setting the file object (fo) and urlpath
-    if data_format == 'reference':
+    if data_format == 'reference' and xarray_open_kwargs['engine'] == 'zarr':
         xarray_open_kwargs['backend_kwargs']['storage_options']['fo'] = urlpath
         xarray_open_kwargs['backend_kwargs']['consolidated'] = False
         urlpath = 'reference://'
 
-    if xarray_open_kwargs['engine'] == 'zarr':
+    if xarray_open_kwargs['engine'] == 'zarr' or data_format == 'opendap':
         url = urlpath
     elif fsspec.utils.can_be_local(urlpath):
         url = fsspec.open_local(urlpath, **storage_options)
+    # Support kerchunk datasets opened with the kerchunk engine
+    elif xarray_open_kwargs['engine'] == 'kerchunk' and data_format == 'reference':
+        url = urlpath
     else:
-        url = fsspec.open(urlpath, **storage_options).open()
+        # we "keep a reference" to the OpenFile so it doesn't close as soon as it is created
+        openfile = fsspec.open(urlpath, **storage_options)
+        url = openfile.open()
 
     # Handle multi-file datasets with `xr.open_mfdataset()`
     if (isinstance(url, str) and '*' in url) or isinstance(url, list):
         # How should we handle concat_dim, and other xr.open_mfdataset kwargs?
         xarray_open_kwargs.update(preprocess=preprocess)
         xarray_open_kwargs.update(parallel=True)
-        ds = xr.open_mfdataset(url, **xarray_open_kwargs)
+        # ds = xr.open_mfdataset(url, **xarray_open_kwargs)
+        ds = _open_dataset_try_auto(url, xr.open_mfdataset, xarray_open_kwargs)
     else:
-        ds = xr.open_dataset(url, **xarray_open_kwargs)
+        # ds = xr.open_dataset(url, **xarray_open_kwargs)
+        ds = _open_dataset_try_auto(url, xr.open_dataset, xarray_open_kwargs)
         if preprocess is not None:
             ds = preprocess(ds)
 
@@ -80,13 +124,20 @@ def _open_dataset(
     if requested_variables:
         if isinstance(requested_variables, str):
             requested_variables = [requested_variables]
+
         variable_intersection = set(requested_variables).intersection(set(varname))
-        variables = [variable for variable in variable_intersection if variable in ds.data_vars]
+
+        data_vars = variable_intersection & set(ds.data_vars)
+        coord_vars = variable_intersection & set(ds.coords)
+
+        variables = list(data_vars | coord_vars)
+
         scalar_variables = [v for v in ds.data_vars if len(ds[v].dims) == 0]
+
         ds = ds.set_coords(scalar_variables)
         ds = ds[variables]
         ds.attrs[OPTIONS['vars_key']] = variables
-    else:
+    elif varname:
         ds.attrs[OPTIONS['vars_key']] = varname
 
     ds = _expand_dims(expand_dims, ds)
@@ -94,11 +145,36 @@ def _open_dataset(
     return ds
 
 
+def _open_dataset_try_auto(url, func: typing.Callable, xarray_open_kwargs) -> xr.Dataset:
+    """
+    Try to open a dataset with chunks set to auto. If we fail because dask doesn't know how to chunk
+    it, set chunks to `{}` and retry. Handles cases where datasets contain things like string variables,
+    which can't be autochunked, as that's restricted to cftime arrays only.
+
+    Attempting to autochunk, rather than always using disk chunks (`{}`) is advantageous as it is generally
+    quite a lot more performant. Unfortunately, there is no straightforward way to detect which variables
+    within a dataset can and can't be autochunked without opening it.
+    """
+    try:
+        ds = func(url, **xarray_open_kwargs)
+    except NotImplementedError as exc:
+        if (
+            xarray_open_kwargs.get('chunks') == 'auto'
+            and 'Can not use auto rechunking with object dtype. We are unable to estimate the size in bytes of object data'
+            in str(exc)
+        ):
+            xarray_open_kwargs['chunks'] = {}
+            ds = func(url, **xarray_open_kwargs)
+        else:
+            raise exc
+    return ds
+
+
 def _update_attrs(*, additional_attrs, ds):
     additional_attrs = additional_attrs or {}
     if additional_attrs:
         additional_attrs = {
-            f"{OPTIONS['attrs_prefix']}:{key}": f'{value}'
+            f'{OPTIONS["attrs_prefix"]}:{key}': f'{value}'
             if isinstance(value, str) or not hasattr(value, '__iter__')
             else ','.join(value)
             for key, value in additional_attrs.items()
@@ -110,6 +186,8 @@ def _update_attrs(*, additional_attrs, ds):
 def _expand_dims(expand_dims, ds):
     if expand_dims:
         for variable in ds.attrs[OPTIONS['vars_key']]:
+            if variable not in ds.data_vars:
+                continue  # Only expand data variables, not coords
             ds[variable] = ds[variable].expand_dims(**expand_dims)
 
     return ds
@@ -121,23 +199,24 @@ class ESMDataSource(DataSource):
     name = 'esm_datasource'
     partition_access = True
 
-    @pydantic.validate_arguments
+    @pydantic.validate_call
     def __init__(
         self,
         key: pydantic.StrictStr,
-        records: typing.List[typing.Dict[str, typing.Any]],
-        variable_column_name: pydantic.StrictStr,
+        records: list[dict[str, typing.Any]],
         path_column_name: pydantic.StrictStr,
-        data_format: typing.Optional[DataFormat],
-        format_column_name: typing.Optional[pydantic.StrictStr],
+        data_format: DataFormat | None,
+        format_column_name: pydantic.StrictStr | None,
         *,
-        aggregations: typing.Optional[typing.List[Aggregation]] = None,
-        requested_variables: typing.List[str] = None,
-        preprocess: typing.Callable = None,
-        storage_options: typing.Dict[str, typing.Any] = None,
-        xarray_open_kwargs: typing.Dict[str, typing.Any] = None,
-        xarray_combine_by_coords_kwargs: typing.Dict[str, typing.Any] = None,
-        intake_kwargs: typing.Dict[str, typing.Any] = None,
+        variable_column_name: pydantic.StrictStr | None = None,
+        aggregations: list[Aggregation] | None = None,
+        requested_variables: list[str] | None = None,
+        preprocess: typing.Callable | None = None,
+        storage_options: dict[str, typing.Any] | None = None,
+        xarray_open_kwargs: dict[str, typing.Any] | None = None,
+        xarray_combine_by_coords_kwargs: dict[str, typing.Any] | None = None,
+        intake_kwargs: dict[str, typing.Any] | None = None,
+        threaded: bool,
     ):
         """An intake compatible Data Source for ESM data.
 
@@ -148,12 +227,12 @@ class ESMDataSource(DataSource):
         records: list of dict
             A list of records, each of which is a dictionary
             mapping column names to values.
-        variable_column_name: str
-            The column name of the variable name.
         path_column_name: str
             The column name of the path.
         data_format: DataFormat
             The data format of the data.
+        variable_column_name: str, optional
+            The column name of the variable name.
         aggregations: list of Aggregation, optional
             A list of aggregations to apply to the data.
         requested_variables: list of str, optional
@@ -169,6 +248,10 @@ class ESMDataSource(DataSource):
             Keyword arguments to pass to :py:func:`~xarray.combine_by_coords` function.
         intake_kwargs: dict, optional
             Additional keyword arguments are passed through to the :py:class:`~intake.source.base.DataSource` base class.
+        threaded : bool , optional
+            If True, use `dask.compute` to load datasets in parallel. If False, load datasets sequentially.
+            If none, the environment variable `ITK_ESM_THREADING` will be used to determine the threading behavior,
+            defaulting to True if the variable is not set.
         """
 
         intake_kwargs = intake_kwargs or {}
@@ -189,6 +272,7 @@ class ESMDataSource(DataSource):
             **self.xarray_combine_by_coords_kwargs,
             **xarray_combine_by_coords_kwargs,
         }
+        self.threaded = threaded
         self._ds = None
 
         if data_format is not None:
@@ -200,10 +284,9 @@ class ESMDataSource(DataSource):
         return f'<{type(self).__name__}  (name: {self.key}, asset(s): {len(self.df)})>'
 
     def _get_schema(self) -> Schema:
-
         if self._ds is None:
             self._open_dataset()
-            metadata = {'dims': {}, 'data_vars': {}, 'coords': ()}
+            metadata: dict[str, typing.Any] = {'dims': {}, 'data_vars': {}, 'coords': ()}
             self._schema = Schema(
                 datashape=None,
                 dtype=None,
@@ -216,11 +299,13 @@ class ESMDataSource(DataSource):
     def _open_dataset(self):
         """Open dataset with xarray"""
 
+        open_ds_func = _get_open_func(self.threaded)
+
         try:
             datasets = [
-                _open_dataset(
+                open_ds_func(
                     record[self.path_column_name],
-                    record[self.variable_column_name],
+                    record[self.variable_column_name] if self.variable_column_name else None,
                     xarray_open_kwargs=_get_xarray_open_kwargs(
                         record['_data_format_'], self.xarray_open_kwargs, self.storage_options
                     ),
@@ -233,31 +318,45 @@ class ESMDataSource(DataSource):
                     requested_variables=self.requested_variables,
                     data_format=record['_data_format_'],
                     additional_attrs=record[~record.isnull()].to_dict(),
+                    storage_options=self.storage_options,
                 )
                 for _, record in self.df.iterrows()
             ]
 
-            datasets = dask.compute(*datasets)
-            if len(datasets) == 1:
+            if self.threaded:
+                datasets = dask.compute(*datasets)
+            if len(datasets) == 1 or not datasets[0].data_vars:
                 self._ds = datasets[0]
             else:
                 datasets = sorted(
                     datasets,
                     key=lambda ds: tuple(
-                        f"{OPTIONS['attrs_prefix']}/{agg.attribute_name}"
+                        f'{OPTIONS["attrs_prefix"]}/{agg.attribute_name}'
                         for agg in self.aggregations
                     ),
                 )
-                with dask.config.set(
-                    {'scheduler': 'single-threaded', 'array.slicing.split_large_chunks': True}
-                ):  # Use single-threaded scheduler
-                    datasets = [
-                        ds.set_coords(set(ds.variables) - set(ds.attrs[OPTIONS['vars_key']]))
-                        for ds in datasets
-                    ]
+                datasets = [
+                    ds.set_coords(set(ds.variables) - set(ds.attrs[OPTIONS['vars_key']]))
+                    for ds in datasets
+                ]
+                try:
                     self._ds = xr.combine_by_coords(
                         datasets, **self.xarray_combine_by_coords_kwargs
                     )
+                except ValueError as exc:
+                    if str(exc) in [
+                        # Error message changed in https://github.com/pydata/xarray/commit/ad92a166ee301302a02cc6f975d0899430806a86
+                        'Could not find any dimension coordinates to use to order the Dataset objects for concatenation',
+                        'Could not find any dimension coordinates to use to order the datasets for concatenation',
+                    ]:
+                        warnings.warn(
+                            'Attempting to concatenate datasets without valid dimension coordinates: retaining only first dataset.'
+                            ' Request valid dimension coordinate to silence this warning.',
+                            category=ConcatenationWarning,
+                        )
+                        self._ds = datasets[0]
+                    else:
+                        raise exc
 
             self._ds.attrs[OPTIONS['dataset_key']] = self.key
 

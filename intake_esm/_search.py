@@ -1,4 +1,5 @@
 import itertools
+import re
 import typing
 
 import numpy as np
@@ -23,14 +24,39 @@ def is_pattern(value):
     try:
         value_ = value
         for char in wildcard_chars:
-            value_ = value_.replace(fr'\{char}', '')
+            value_ = value_.replace(rf'\{char}', '')
         return any(char in value_ for char in wildcard_chars)
     except (TypeError, AttributeError):
         return False
 
 
+def is_stringtype(series):
+    # scalar
+    if isinstance(series.dtype, pd.core.arrays.string_.StringDtype) or series.dtype in [
+        'string',
+        'large_string',
+    ]:
+        return True
+    # iterable (pandas has no list dtype, so it's pyarrow for sure)
+    if series.dtype.type is list and series.dtype.pyarrow_dtype.value_type in [
+        'string',
+        'large_string',
+    ]:
+        return True
+    # generic object, a bit more complicated, we only support sets, tuples and lists
+    if series.dtype == 'object' and isinstance(series.iloc[0], (set, tuple, list)):
+        return isinstance(next(iter(series.iloc[0])), str)
+    return False
+
+
+def iterable_contains(data, value, regex=False):
+    if regex:
+        return any([re.search(value, d) for d in data])
+    return value in data
+
+
 def search(
-    *, df: pd.DataFrame, query: typing.Dict[str, typing.Any], columns_with_iterables: set
+    *, df: pd.DataFrame, query: dict[str, typing.Any], columns_with_iterables: set
 ) -> pd.DataFrame:
     """Search for entries in the catalog."""
 
@@ -39,15 +65,17 @@ def search(
     global_mask = np.ones(len(df), dtype=bool)
     for column, values in query.items():
         local_mask = np.zeros(len(df), dtype=bool)
-        column_is_stringtype = isinstance(
-            df[column].dtype, (object, pd.core.arrays.string_.StringDtype)
-        )
+        column_is_stringtype = is_stringtype(df[column])
         column_has_iterables = column in columns_with_iterables
         for value in values:
             if column_has_iterables:
-                mask = df[column].str.contains(value, regex=False)
+                mask = df[column].transform(
+                    iterable_contains, value=value, regex=is_pattern(value) & column_is_stringtype
+                )
             elif column_is_stringtype and is_pattern(value):
                 mask = df[column].str.contains(value, regex=True, case=True, flags=0)
+            elif pd.isna(value):
+                mask = df[column].isnull()
             else:
                 mask = df[column] == value
             local_mask = local_mask | mask
@@ -59,9 +87,9 @@ def search(
 def search_apply_require_all_on(
     *,
     df: pd.DataFrame,
-    query: typing.Dict[str, typing.Any],
-    require_all_on: typing.Union[str, typing.List[typing.Any]],
-    columns_with_iterables: set = None,
+    query: dict[str, typing.Any],
+    require_all_on: str | list[typing.Any],
+    columns_with_iterables: set | None = None,
 ) -> pd.DataFrame:
     _query = query.copy()
     # Make sure to remove columns that were already

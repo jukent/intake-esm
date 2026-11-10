@@ -59,9 +59,11 @@ intake-esm could always use more documentation. What exactly is needed?
 You can also edit documentation files directly in the GitHub web interface,
 without using a local copy. This can be convenient for small fixes.
 
-Build the documentation locally with the following command:
+To build the docs locally, follow the steps 1 and 2 under [Preparing Pull Requests](#preparing-pull-requests) below and then create a conda environment and build the docs with the following commands:
 
 ```bash
+$ conda env update -f ci/environment-docs.yml
+$ conda activate intake-esm-doc
 $ make docs
 ```
 
@@ -78,14 +80,14 @@ $ make docs
    $ git remote add upstream git@github.com:intake/intake-esm.git
    ```
 
-   now, to fix a bug or add feature create your own branch off "master":
+   now, to fix a bug or add feature create your own branch off "main":
 
    ```bash
-   $ git checkout -b your-bugfix-feature-branch-name master
+   $ git checkout -b your-bugfix-feature-branch-name main
    ```
 
    If you need some help with Git, follow this quick start
-   guide: https://git.wiki.kernel.org/index.php/QuickStart
+   guide: https://docs.github.com/en/get-started/getting-started-with-git
 
 3. Install dependencies into a new conda environment::
 
@@ -100,7 +102,7 @@ $ make docs
    $ python -m pip install -e .
    ```
 
-5. Install `pre-commit <https://pre-commit.com>`\_ hooks on the intake-esm repo::
+5. Install [pre-commit](https://pre-commit.com) hooks on the intake-esm repo::
 
    ```bash
    $ pre-commit install
@@ -108,7 +110,7 @@ $ make docs
 
    Afterwards `pre-commit` will run whenever you commit.
 
-   [pre-commit](https://pre-commit.com) is a framework for managing and maintaining multi-language pre-commit hooks to ensure code-style and code formatting is consistent.
+   `pre-commit` is a framework for managing and maintaining multi-language pre-commit hooks to ensure code-style and code formatting is consistent.
 
    Now you have an environment called `intake-esm-dev` that you can work in.
    You’ll need to make sure to activate that environment next time you want
@@ -140,5 +142,5 @@ $ make docs
    compare: your-branch-name
 
    base-fork: intake/intake-esm
-   base: master # if it's a bugfix or feature
+   base: main # if it's a bugfix or feature
    ```

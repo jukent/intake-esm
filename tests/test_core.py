@@ -1,18 +1,40 @@
 import ast
+import json
 import os
+from unittest import mock
 
-import dask
 import intake
+import packaging.version
 import pandas as pd
+import polars as pl
 import pydantic
 import pytest
 import xarray as xr
-from datatree import DataTree
+from polars.testing import assert_frame_equal as assert_frame_equal_pl
+
+if packaging.version.Version(xr.__version__) < packaging.version.Version('2024.10'):
+    from datatree import DataTree
+else:
+    from xarray import DataTree
 
 import intake_esm
 
-dask.config.set(scheduler='single-threaded')
-
+from .utils import (
+    access_columns_with_lists_cat,
+    access_columns_with_tuples_cat,
+    catalog_dict_records,
+    cdf_cat_sample_cesmle,
+    cdf_cat_sample_cmip5,
+    cdf_cat_sample_cmip6,
+    cdf_cat_sample_cmip6_noagg,
+    mixed_cat_sample_cmip6,
+    multi_variable_cat,
+    opendap_cat_sample_noaa,
+    sample_df,
+    sample_esmcat_data,
+    zarr_cat_aws_cesm,
+    zarr_cat_pangeo_cmip6,
+)
 
 registry = intake_esm.DerivedVariableRegistry()
 
@@ -40,35 +62,27 @@ def func_multivar(ds):
     return ds + 1
 
 
-from .utils import (
-    catalog_dict_records,
-    cdf_cat_sample_cesmle,
-    cdf_cat_sample_cmip5,
-    cdf_cat_sample_cmip6,
-    mixed_cat_sample_cmip6,
-    multi_variable_cat,
-    sample_df,
-    sample_esmcat_data,
-    zarr_cat_aws_cesm,
-    zarr_cat_pangeo_cmip6,
-)
-
-
 @pytest.mark.parametrize(
-    'obj, sep, read_csv_kwargs',
+    'obj, sep, read_kwargs, columns_with_iterables',
     [
-        (catalog_dict_records, '.', None),
-        (cdf_cat_sample_cmip6, '/', None),
-        (zarr_cat_aws_cesm, '.', None),
-        (zarr_cat_pangeo_cmip6, '*', None),
-        (cdf_cat_sample_cesmle, '.', None),
-        (multi_variable_cat, '*', {'converters': {'variable': ast.literal_eval}}),
-        ({'esmcat': sample_esmcat_data, 'df': sample_df}, '.', None),
+        (catalog_dict_records, '.', None, None),
+        (cdf_cat_sample_cmip6_noagg, '.', None, None),
+        (cdf_cat_sample_cmip6, '/', None, None),
+        (zarr_cat_aws_cesm, '.', None, None),
+        (zarr_cat_pangeo_cmip6, '*', None, None),
+        (cdf_cat_sample_cesmle, '.', None, None),
+        (multi_variable_cat, '*', {'converters': {'variable': ast.literal_eval}}, None),
+        (multi_variable_cat, '*', None, ['variable']),
+        ({'esmcat': sample_esmcat_data, 'df': sample_df}, '.', None, None),
+        (intake_esm.cat.ESMCatalogModel.load(cdf_cat_sample_cmip6), '.', None, None),
     ],
 )
-def test_catalog_init(capsys, obj, sep, read_csv_kwargs):
+@pytest.mark.flaky(max_runs=3, min_passes=1)  # Cold start related failures
+def test_catalog_init(capsys, obj, sep, read_kwargs, columns_with_iterables):
     """Test that the catalog can be initialized."""
-    cat = intake.open_esm_datastore(obj, sep=sep, read_csv_kwargs=read_csv_kwargs)
+    cat = intake.open_esm_datastore(
+        obj, sep=sep, read_kwargs=read_kwargs, columns_with_iterables=columns_with_iterables
+    )
     assert isinstance(cat.esmcat, intake_esm.cat.ESMCatalogModel)
     assert isinstance(cat.df, pd.DataFrame)
     assert len(cat) > 0
@@ -78,6 +92,278 @@ def test_catalog_init(capsys, obj, sep, read_csv_kwargs):
     # https://docs.pytest.org/en/latest/capture.html#accessing-captured-output-from-a-test-function
     captured = capsys.readouterr()
     assert 'catalog with' in captured.out
+
+
+@pytest.mark.parametrize(
+    'obj, sep, read_kwargs, read_csv_kwargs',
+    [
+        (  # Both
+            multi_variable_cat,
+            '*',
+            {'converters': {'variable': ast.literal_eval}},
+            {'converters': {'variable': ast.literal_eval}},
+        ),
+        (  # Read kwargs only
+            multi_variable_cat,
+            '*',
+            {'converters': {'variable': ast.literal_eval}},
+            None,
+        ),
+        (  # Read csv kwargs only
+            multi_variable_cat,
+            '*',
+            None,
+            {'converters': {'variable': ast.literal_eval}},
+        ),
+    ],
+)
+@pytest.mark.flaky(max_runs=3, min_passes=1)  # Cold start related failures
+def test_catalog_init_back_compat(capsys, obj, sep, read_kwargs, read_csv_kwargs):
+    """Test that the catalog can be initialized with various combinations of read
+    and read_csv kwargs, rasing and warning appropriately. Retains much of the logic
+    of the test above to make sure behaviour is consistent."""
+
+    if read_kwargs and read_csv_kwargs:
+        with pytest.raises(
+            ValueError, match='Cannot provide both `read_csv_kwargs` and `read_kwargs`. '
+        ):
+            intake.open_esm_datastore(
+                obj, sep=sep, read_kwargs=read_kwargs, read_csv_kwargs=read_csv_kwargs
+            )
+        return None
+
+    if read_csv_kwargs:
+        with pytest.warns(
+            DeprecationWarning,
+            match='read_csv_kwargs is deprecated and will be removed in a future version. ',
+        ):
+            cat = intake.open_esm_datastore(obj, sep=sep, read_csv_kwargs=read_csv_kwargs)
+
+    else:
+        cat = intake.open_esm_datastore(obj, sep=sep, read_csv_kwargs=read_csv_kwargs)
+
+    cat = intake.open_esm_datastore(obj, sep=sep, read_kwargs=read_kwargs)
+    assert isinstance(cat.esmcat, intake_esm.cat.ESMCatalogModel)
+    assert isinstance(cat.df, pd.DataFrame)
+    assert len(cat) > 0
+
+    print(repr(cat))
+    # Use pytest-capturing method
+    # https://docs.pytest.org/en/latest/capture.html#accessing-captured-output-from-a-test-function
+    captured = capsys.readouterr()
+    assert 'catalog with' in captured.out
+
+
+@pytest.mark.parametrize(
+    'obj, read_kwargs, columns_with_iterables',
+    [
+        (multi_variable_cat, {'converters': {'variable': ast.literal_eval}}, None),
+        (multi_variable_cat, None, ['variable']),
+    ],
+)
+def test_columns_with_iterables(capsys, obj, read_kwargs, columns_with_iterables):
+    """Test that columns with iterables are successfully evaluated."""
+    cat = intake.open_esm_datastore(
+        obj, read_kwargs=read_kwargs, columns_with_iterables=columns_with_iterables
+    )
+    assert 'variable' in cat.esmcat.columns_with_iterables
+
+
+def test_read_csv_conflict():
+    """Test that error is raised when `columns_with_iterables` conflicts with `read_kwargs`."""
+    # Work when inputs are consistent
+    intake.open_esm_datastore(
+        multi_variable_cat,
+        read_kwargs={'converters': {'variable': ast.literal_eval}},
+        columns_with_iterables=['variable'],
+    )
+
+    # Fails on conflict
+    with pytest.raises(ValueError):
+        intake.open_esm_datastore(
+            multi_variable_cat,
+            read_kwargs={'converters': {'variable': lambda x: x}},
+            columns_with_iterables=['variable'],
+        )
+
+
+def test_write_csv_conflict(tmp_path):
+    """Test that error is raised when `to_csv_kwargs` conflicts with `write_kwargs`."""
+    cat = intake.open_esm_datastore(catalog_dict_records)
+    file_format = 'csv'
+
+    kwargs = {
+        'name': 'test_catalog',
+        'directory': tmp_path,
+        'catalog_type': 'file',
+        'file_format': file_format,
+        'write_kwargs': {'compression': 'gzip'},
+    }
+
+    # Work when inputs are consistent
+    cat.serialize(**kwargs)
+
+    kwargs['to_csv_kwargs'] = kwargs['write_kwargs']
+    # Fails on conflict
+    with pytest.raises(ValueError):
+        cat.serialize(
+            name='test_catalog',
+            directory=tmp_path,
+            catalog_type='file',
+            file_format=file_format,
+            write_kwargs={'compression': 'gzip'},
+            to_csv_kwargs={'compression': 'gzip'},
+        )
+
+    kwargs.pop('write_kwargs')
+
+    with pytest.warns(
+        DeprecationWarning,
+        match='to_csv_kwargs is deprecated and will be removed in a future version. ',
+    ):
+        cat.serialize(
+            name='test_catalog',
+            directory=tmp_path,
+            catalog_type='file',
+            file_format=file_format,
+            to_csv_kwargs={'compression': 'gzip'},
+        )
+
+
+@pytest.mark.parametrize(
+    'file_format_1',
+    [
+        'csv',
+        'parquet',
+    ],
+)
+@pytest.mark.parametrize(
+    'file_format_2',
+    [
+        'csv',
+        'parquet',
+    ],
+)
+def test_open_and_reserialize(tmp_path, file_format_1, file_format_2):
+    """
+    Open a catalog, and then re-serialize it into `tmp_path`. We want to
+    make sure that the reserialised catalog is the same as the original, but that
+    the catalog file is stored in the correct format.
+
+    Note: Round-trip twice as it seems the defaults have changed since the test dataset was
+    created. Only affects unspecified fields.
+    """
+    catalog = intake.open_esm_datastore(cdf_cat_sample_cmip5)
+    expected_table = catalog.df.copy(deep=True)
+
+    catalog.serialize(
+        name='serialized',
+        directory=tmp_path,
+        catalog_type='file',
+        file_format=file_format_1,
+        storage_options={},
+    )
+
+    catalog = intake.open_esm_datastore(tmp_path / 'serialized.json')
+    pd.testing.assert_frame_equal(catalog.df, expected_table, check_dtype=False)
+
+    catalog.serialize(
+        name='reserialized',
+        directory=tmp_path,
+        catalog_type='file',
+        file_format=file_format_2,
+        storage_options={},
+    )
+
+    with open(tmp_path / 'serialized.json') as f:
+        serialized = json.load(f)
+
+    with open(tmp_path / 'reserialized.json') as f:
+        reserialized = json.load(f)
+
+    assert serialized.get('catalog_file', '').endswith(file_format_1)
+    assert reserialized.get('catalog_file', '').endswith(file_format_2)
+
+    # Remove fields that are expected to change
+    changed_fieldnames = ['catalog_file', 'last_updated', 'id', 'title']
+    for field in changed_fieldnames:
+        serialized.pop(field, None)
+        reserialized.pop(field, None)
+
+    assert serialized == reserialized
+    reopened = intake.open_esm_datastore(tmp_path / 'reserialized.json')
+    pd.testing.assert_frame_equal(reopened.df, expected_table, check_dtype=False)
+
+
+@pytest.mark.parametrize('first_format', ['csv', 'parquet'])
+@pytest.mark.parametrize('second_format', ['csv', 'parquet'])
+def test_iterable_serialization_preserves_values(tmp_path, first_format, second_format):
+    """Iterable values survive repeated round trips between csv and parquet."""
+    read_kwargs = {'converters': {'variable': ast.literal_eval}}
+    catalog = intake.open_esm_datastore(access_columns_with_lists_cat, read_kwargs=read_kwargs)
+    expected = catalog.df.copy(deep=True)
+    expected['variable'] = expected['variable'].astype(object).apply(tuple)
+    for i, file_format in enumerate([first_format, second_format]):
+        name = f'roundtrip_{i}'
+        catalog.serialize(
+            name=name, directory=tmp_path, catalog_type='file', file_format=file_format
+        )
+        catalog = intake.open_esm_datastore(
+            tmp_path / f'{name}.json', read_kwargs=read_kwargs if file_format == 'csv' else None
+        )
+        actual = catalog.df.copy(deep=True)
+        actual['variable'] = actual['variable'].astype(object).apply(tuple)
+        pd.testing.assert_frame_equal(actual, expected, check_dtype=False)
+
+
+@pytest.mark.parametrize(
+    'literal, expected',
+    [
+        ("['a', 'b']", ('a', 'b')),
+        ("('a', 'b')", ('a', 'b')),
+        ("{'a', 'b'}", ('a', 'b')),
+        ("('a',)", ('a',)),
+    ],
+    ids=['list', 'tuple', 'set', 'single-item-tuple'],
+)
+def test_read_iterable_literals(tmp_path, literal, expected):
+    """Catalogs written with list, tuple or set literals in iterable columns can be read."""
+    pd.DataFrame({'path': ['a.nc', 'b.nc'], 'variable': [literal, literal]}).to_csv(
+        tmp_path / 'cat.csv', index=False
+    )
+    with open(tmp_path / 'cat.json', 'w') as f:
+        json.dump(
+            {
+                'esmcat_version': '0.1.0',
+                'id': 'iterable-literals',
+                'description': '',
+                'catalog_file': 'cat.csv',
+                'attributes': [],
+                'assets': {'column_name': 'path', 'format': 'netcdf'},
+            },
+            f,
+        )
+
+    catalog = intake.open_esm_datastore(
+        tmp_path / 'cat.json', read_kwargs={'converters': {'variable': ast.literal_eval}}
+    )
+    assert catalog.esmcat.columns_with_iterables == {'variable'}
+    assert catalog.df['variable'].astype(object).apply(tuple).tolist() == [expected, expected]
+
+
+def test_parquet_filename_preserves_catalog_name(tmp_path):
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip5)
+    cat.serialize(name='physics', directory=tmp_path, catalog_type='file', file_format='parquet')
+    assert (tmp_path / 'physics.parquet').is_file()
+
+
+@pytest.mark.parametrize('use_model', [False, True])
+def test_serialization_rejects_unknown_file_format(tmp_path, use_model):
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip5)
+    save = cat.esmcat.save if use_model else cat.serialize
+    with pytest.raises(ValueError, match='file_format'):
+        save(name='invalid', directory=tmp_path, catalog_type='file', file_format='orc')
+    assert not (tmp_path / 'invalid.json').exists()
 
 
 @pytest.mark.parametrize(
@@ -99,24 +385,39 @@ def test_invalid_derivedcat(query, regex):
         intake.open_esm_datastore(catalog_dict_records, registry=registry)
 
 
+def test_impossible_derivedcat():
+    registry = intake_esm.DerivedVariableRegistry()
+
+    @registry.register(variable='FOO', query={'variable': ['FLNS', 'FLUT']})
+    def func(ds):
+        ds['FOO'] = ds.FLNS + ds.FLUT
+        return ds
+
+    with pytest.raises(ValueError, match='Variable derivation requires `aggregation_control`'):
+        intake.open_esm_datastore(cdf_cat_sample_cmip6_noagg, registry=registry)
+
+
 @pytest.mark.parametrize(
-    'obj, sep, read_csv_kwargs',
+    'obj, sep, read_kwargs',
     [
         (multi_variable_cat, '.', {'converters': {'variable': ast.literal_eval}}),
         (cdf_cat_sample_cesmle, '/', None),
         (cdf_cat_sample_cmip5, '.', None),
         (cdf_cat_sample_cmip6, '*', None),
         (catalog_dict_records, '.', None),
+        (cdf_cat_sample_cmip6_noagg, '.', None),
         ({'esmcat': sample_esmcat_data, 'df': sample_df}, '.', None),
     ],
 )
-def test_catalog_unique(obj, sep, read_csv_kwargs):
-    cat = intake.open_esm_datastore(obj, sep=sep, read_csv_kwargs=read_csv_kwargs)
+def test_catalog_unique(obj, sep, read_kwargs):
+    cat = intake.open_esm_datastore(obj, sep=sep, read_kwargs=read_kwargs)
     uniques = cat.unique()
     nuniques = cat.nunique()
     assert isinstance(uniques, pd.Series)
     assert isinstance(nuniques, pd.Series)
-    assert len(uniques.keys()) == len(cat.df.columns) + 1  # for derived_variable entry
+    assert len(uniques.keys()) == len(cat.df.columns) + (
+        0 if obj is cdf_cat_sample_cmip6_noagg else 1
+    )  # for derived_variable entry
 
 
 def test_catalog_contains():
@@ -138,6 +439,22 @@ def test_catalog_contains():
 )
 def test_catalog_search(path, query, expected_size):
     cat = intake.open_esm_datastore(path)
+    new_cat = cat.search(**query)
+    assert len(new_cat) == expected_size
+
+
+@pytest.mark.parametrize(
+    'path, columns_with_iterables, query, expected_size',
+    [
+        (access_columns_with_lists_cat, ['variable'], {'variable': ['aice_m']}, 1),
+        (access_columns_with_tuples_cat, ['variable'], {'variable': ['aice_m']}, 1),
+    ],
+)
+def test_catalog_search_columns_with_iterables(path, columns_with_iterables, query, expected_size):
+    cat = intake.open_esm_datastore(path, columns_with_iterables=columns_with_iterables)
+
+    for iter_col in columns_with_iterables:
+        assert isinstance(cat.df[iter_col][0], list)
     new_cat = cat.search(**query)
     assert len(new_cat) == expected_size
 
@@ -172,8 +489,9 @@ def test_catalog_getitem_error():
         cat['foo']
 
 
-def test_catalog_keys_info():
-    cat = intake.open_esm_datastore(cdf_cat_sample_cesmle)
+@pytest.mark.parametrize('cat', [cdf_cat_sample_cesmle, cdf_cat_sample_cmip6_noagg])
+def test_catalog_keys_info(cat):
+    cat = intake.open_esm_datastore(cat)
     data = cat.keys_info()
     assert isinstance(data, pd.DataFrame)
     assert data.index.name == 'key'
@@ -185,6 +503,8 @@ def test_catalog_keys_info():
     [
         ('file', {'compression': 'bz2'}, {}, '.'),
         ('file', {'compression': 'gzip'}, {}, None),
+        ('file', {'compression': 'xz'}, {}, '.'),
+        ('file', {'compression': 'zip'}, {}, '.'),
         ('dict', {}, {}, None),
     ],
 )
@@ -204,8 +524,24 @@ def test_catalog_serialize(catalog_type, to_csv_kwargs, json_dump_kwargs, direct
     if directory is None:
         directory = os.getcwd()
     cat = intake.open_esm_datastore(f'{directory}/{name}.json')
-    pd.testing.assert_frame_equal(
-        cat_subset.df.reset_index(drop=True), cat.df.reset_index(drop=True)
+    subset_df = cat_subset.esmcat.pl_df.with_columns(
+        [
+            pl.col(colname).cast(pl.Null)
+            for colname in cat_subset.esmcat._frames.pl_df.columns
+            if cat_subset.esmcat._frames.pl_df.get_column(colname).is_null().all()
+        ]
+    )
+
+    df = cat.esmcat.pl_df.with_columns(
+        [
+            pl.col(colname).cast(pl.Null)
+            for colname in cat.esmcat._frames.pl_df.columns
+            if cat.esmcat._frames.pl_df.get_column(colname).is_null().all()
+        ]
+    )
+    assert_frame_equal_pl(
+        subset_df,
+        df,
     )
     assert cat.esmcat.id == name
 
@@ -247,7 +583,7 @@ def test_multi_variable_catalog(query):
     import ast
 
     cat = intake.open_esm_datastore(
-        multi_variable_cat, read_csv_kwargs={'converters': {'variable': ast.literal_eval}}
+        multi_variable_cat, read_kwargs={'converters': {'variable': ast.literal_eval}}
     )
     assert cat.esmcat.has_multiple_variable_assets
 
@@ -264,7 +600,7 @@ def test_multi_variable_catalog_derived_cat():
 
     cat = intake.open_esm_datastore(
         multi_variable_cat,
-        read_csv_kwargs={'converters': {'variable': ast.literal_eval}},
+        read_kwargs={'converters': {'variable': ast.literal_eval}},
         registry=registry_multivar,
     )
     cat_sub = cat.search(variable=['FOO'])
@@ -291,14 +627,21 @@ def test_multi_variable_catalog_derived_cat():
             dict(source_id=['CNRM-ESM2-1', 'CNRM-CM6-1', 'BCC-ESM1'], variable_id=['tasmax']),
             {'chunks': {'time': 1}},
         ),
+        (
+            cdf_cat_sample_cmip6_noagg,
+            dict(source_id=['CNRM-ESM2-1', 'CNRM-CM6-1', 'BCC-ESM1'], variable_id=['tasmax']),
+            {'chunks': {'time': 1}},
+        ),
         (mixed_cat_sample_cmip6, dict(institution_id='BCC'), {}),
     ],
 )
+@pytest.mark.flaky(max_runs=3, min_passes=1)  # Cold start related failures
 def test_to_dataset_dict(path, query, xarray_open_kwargs):
     cat = intake.open_esm_datastore(path)
     cat_sub = cat.search(**query)
     _, ds = cat_sub.to_dataset_dict(xarray_open_kwargs=xarray_open_kwargs).popitem()
-    assert 'member_id' in ds.dims
+    if path != cdf_cat_sample_cmip6_noagg:
+        assert 'member_id' in ds.dims
     assert len(ds.__dask_keys__()) > 0
     assert ds.time.encoding
 
@@ -325,6 +668,7 @@ def test_to_dataset_dict(path, query, xarray_open_kwargs):
         ),
     ],
 )
+@pytest.mark.flaky(max_runs=3, min_passes=1)  # Cold start related failures
 def test_to_datatree(path, query, xarray_open_kwargs):
     cat = intake.open_esm_datastore(path)
     cat_sub = cat.search(**query)
@@ -334,6 +678,29 @@ def test_to_datatree(path, query, xarray_open_kwargs):
     assert len(ds.__dask_keys__()) > 0
     assert ds.time.encoding
     assert isinstance(tree, DataTree)
+
+
+def test_to_datatree_levels():
+    cat = intake.open_esm_datastore(zarr_cat_pangeo_cmip6)
+    cat_sub = cat.search(
+        **dict(
+            variable_id=['pr'],
+            experiment_id='ssp370',
+            activity_id='AerChemMIP',
+            source_id='BCC-ESM1',
+            table_id='Amon',
+            grid_label='gn',
+        ),
+    )
+
+    tree = cat_sub.to_datatree(
+        xarray_open_kwargs={
+            'consolidated': True,
+            'backend_kwargs': {'storage_options': {'token': 'anon'}},
+        },
+        levels=['source_id'],
+    )
+    assert list(tree.keys()) == ['BCC-ESM1']
 
 
 @pytest.mark.parametrize(
@@ -375,6 +742,7 @@ def test_to_dask(path, query, xarray_open_kwargs):
     'path, query',
     [
         (cdf_cat_sample_cmip6, {'experiment_id': ['historical', 'rcp85']}),
+        (cdf_cat_sample_cmip6_noagg, {'experiment_id': ['historical', 'rcp85']}),
         (cdf_cat_sample_cmip5, {'experiment': ['historical', 'rcp85']}),
     ],
 )
@@ -444,7 +812,6 @@ def test_to_dataset_dict_skip_error():
 
 
 def test_to_dataset_dict_with_registry():
-
     registry = intake_esm.DerivedVariableRegistry()
 
     @registry.register(variable='FOO', query={'variable': ['FLNS', 'FLUT']})
@@ -474,6 +841,14 @@ def test_to_dataset_dict_with_registry():
         )
 
 
+def test_to_dask_opendap():
+    cat = intake.open_esm_datastore(opendap_cat_sample_noaa)
+    new_cat = cat.search(variable='sst', first_swap='2005001', scode=482)
+    ds = new_cat.to_dask(xarray_open_kwargs=dict(engine='pydap'))
+    assert 'sst' in ds.data_vars
+    assert len(ds.__dask_keys__()) > 0
+
+
 def test_subclassing_catalog():
     class ChildCatalog(intake_esm.esm_datastore):
         pass
@@ -491,3 +866,114 @@ def test_options():
             xarray_open_kwargs={'backend_kwargs': {'storage_options': {'anon': True}}},
         ).popitem()
         assert ds.attrs['myprefix:component'] == 'atm'
+
+
+@pytest.mark.parametrize(
+    'threaded, ITK_ESM_THREADING, expected',
+    [
+        (True, 'True', True),
+        (True, 'False', True),
+        (False, 'True', False),
+        (False, 'False', False),
+        (None, 'True', True),  # Keep previous default behavior
+        (None, 'False', False),
+        (None, 1, False),
+    ],
+)
+@mock.patch('os.getenv')
+def test__get_threaded(mock_get_env, threaded, ITK_ESM_THREADING, expected):
+    mock_get_env.return_value = ITK_ESM_THREADING
+    if isinstance(ITK_ESM_THREADING, int):
+        with pytest.raises(
+            ValueError,
+            match='The environment variable ITK_ESM_THREADING must be a boolean, if set.',
+        ):
+            intake_esm.core._get_threaded(threaded)
+    else:
+        assert intake_esm.core._get_threaded(threaded) == expected
+
+
+@pytest.mark.parametrize(
+    'groupby_attrs, varying_attrs',
+    [
+        (['source_id', 'table_id'], ['source_id']),
+        (['source_id', 'experiment_id', 'table_id'], ['source_id', 'experiment_id']),
+    ],
+)
+def test_to_dask_error_names_varying_groupby_attrs(groupby_attrs, varying_attrs):
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        variable_id='tasmax', table_id='Amon'
+    )
+    cat.esmcat.aggregation_control.groupby_attrs = groupby_attrs
+    assert len(cat) > 1
+    with pytest.raises(ValueError, match=f'Received {len(cat)} datasets') as exc:
+        cat.to_dask()
+    assert f'refine your search on {", ".join(varying_attrs)} or' in str(exc.value)
+    assert '.to_dataset_dict()' in str(exc.value)
+
+
+def test_to_dask_error_with_method_named_grouping_column():
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        variable_id='tasmax', table_id='Amon'
+    )
+    cat.df['items'] = cat.df['source_id']
+    cat.esmcat.aggregation_control.groupby_attrs = ['items', 'table_id']
+    assert len(cat) > 1
+    with pytest.raises(ValueError, match='refine your search on items or'):
+        cat.to_dask()
+
+
+def test_to_dask_error_for_empty_search():
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        source_id='not-a-model-in-this-catalog'
+    )
+    assert len(cat) == 0
+    with pytest.raises(ValueError, match='Received 0 datasets'):
+        cat.to_dask()
+
+
+def test_to_dask_returns_real_single_dataset():
+    cat = intake.open_esm_datastore(cdf_cat_sample_cmip6).search(
+        source_id='BCC-ESM1', variable_id='tasmax', experiment_id='piControl'
+    )
+    assert len(cat) == 1
+    ds = cat.to_dask(
+        threaded=False, xarray_open_kwargs={'engine': 'h5netcdf', 'chunks': {}}, progressbar=False
+    )
+    try:
+        with xr.open_dataset(cat.df.path.iloc[0], engine='h5netcdf') as original:
+            xr.testing.assert_equal(ds.tasmax.isel(member_id=0, drop=True), original.tasmax)
+    finally:
+        ds.close()
+
+
+@pytest.mark.parametrize('dtype', [pl.List(pl.String), pl.List(pl.Categorical)])
+def test_iterable_schema_overrides(dtype):
+    cat = intake.open_esm_datastore(
+        multi_variable_cat,
+        columns_with_iterables=['variable'],
+        read_kwargs={'schema_overrides': {'variable': dtype, 'component': pl.Categorical}},
+    )
+    expected = pd.read_csv(cat.esmcat.catalog_file, converters={'variable': ast.literal_eval})
+    assert cat.esmcat.pl_df.schema['variable'] == dtype
+    assert cat.esmcat.pl_df.schema['component'] == pl.Categorical
+    assert cat.esmcat.pl_df['variable'].to_list() == [list(v) for v in expected.variable]
+    assert cat.esmcat.pl_df['component'].to_list() == expected.component.tolist()
+
+
+def test_numeric_iterable_schema_override(tmp_path):
+    with open(multi_variable_cat) as f:
+        metadata = json.load(f)
+    source = intake.open_esm_datastore(multi_variable_cat, columns_with_iterables=['variable'])
+    table = pd.read_csv(source.esmcat.catalog_file)
+    table['levels'] = str([1, 2])
+    table.to_csv(tmp_path / 'catalog.csv', index=False)
+    metadata['catalog_file'] = 'catalog.csv'
+    (tmp_path / 'catalog.json').write_text(json.dumps(metadata))
+    cat = intake.open_esm_datastore(
+        tmp_path / 'catalog.json',
+        columns_with_iterables=['variable', 'levels'],
+        read_kwargs={'schema_overrides': {'levels': pl.List(pl.Int64)}},
+    )
+    assert cat.esmcat.pl_df.schema['levels'] == pl.List(pl.Int64)
+    assert cat.esmcat.pl_df['levels'].to_list() == [[1, 2]] * len(table)
